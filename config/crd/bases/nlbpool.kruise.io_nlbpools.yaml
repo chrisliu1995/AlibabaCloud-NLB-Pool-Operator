@@ -1,0 +1,180 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.14.0
+  name: nlbpools.nlbpool.kruise.io
+spec:
+  group: nlbpool.kruise.io
+  names:
+    kind: NLBPool
+    listKind: NLBPoolList
+    plural: nlbpools
+    singular: nlbpool
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.totalNLBs
+      name: NLBs
+      type: integer
+    - jsonPath: .status.availableServices
+      name: Available
+      type: integer
+    - jsonPath: .status.boundServices
+      name: Bound
+      type: integer
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: NLBPool is the Schema for the nlbpools API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: NLBPoolSpec defines the desired state of NLBPool
+            properties:
+              blockPorts:
+                description: BlockPorts is the list of ports to skip
+                items:
+                  format: int32
+                  type: integer
+                type: array
+              eipIspTypes:
+                description: |-
+                  EipIspTypes is the list of EIP ISP types
+                  e.g.: BGP, BGP_PRO, ChinaTelecom, ChinaUnicom, ChinaMobile
+                items:
+                  type: string
+                type: array
+              externalTrafficPolicy:
+                description: ExternalTrafficPolicy defines the traffic policy for
+                  Service
+                type: string
+              healthCheck:
+                description: HealthCheck defines NLB health check configuration
+                properties:
+                  connectPort:
+                    description: ConnectPort is the health check port
+                    type: string
+                  connectTimeout:
+                    description: ConnectTimeout is the connection timeout
+                    type: string
+                  domain:
+                    description: Domain is the HTTP health check domain
+                    type: string
+                  flag:
+                    description: Flag is the health check switch (on/off)
+                    type: string
+                  healthyThreshold:
+                    description: HealthyThreshold is the healthy threshold
+                    type: string
+                  interval:
+                    description: Interval is the check interval
+                    type: string
+                  method:
+                    description: Method is the HTTP health check method
+                    type: string
+                  type:
+                    description: Type is the health check type (tcp/http)
+                    type: string
+                  unhealthyThreshold:
+                    description: UnhealthyThreshold is the unhealthy threshold
+                    type: string
+                  uri:
+                    description: Uri is the HTTP health check path
+                    type: string
+                type: object
+              maxPort:
+                description: MaxPort is the maximum port for NLB Listener
+                format: int32
+                type: integer
+              minAvailable:
+                description: |-
+                  MinAvailable is the minimum number of available (unbound) Services to maintain
+                  When available count drops below this value, Controller automatically creates new NLBs
+                type: integer
+              minPort:
+                description: MinPort is the minimum port for NLB Listener
+                format: int32
+                type: integer
+              portsPerPod:
+                description: PortsPerPod is the number of ports required per Pod
+                type: integer
+              protocols:
+                description: Protocols is the list of protocols for each port
+                items:
+                  default: TCP
+                  type: string
+                type: array
+              securityProtectionTypes:
+                description: SecurityProtectionTypes defines EIP security protection
+                  types
+                items:
+                  type: string
+                type: array
+              zoneMaps:
+                description: |-
+                  ZoneMaps defines VPC and zone mapping
+                  Format: "vpc-xxx@zone1:vswitch1,zone2:vswitch2"
+                type: string
+            required:
+            - maxPort
+            - minAvailable
+            - minPort
+            - portsPerPod
+            - protocols
+            - zoneMaps
+            type: object
+          status:
+            description: NLBPoolStatus defines the observed state of NLBPool
+            properties:
+              availableServices:
+                description: AvailableServices is the number of available (unbound)
+                  Services
+                type: integer
+              boundServices:
+                description: BoundServices is the number of bound Services
+                type: integer
+              phase:
+                description: Phase is the current phase of NLBPool
+                type: string
+              readyNLBs:
+                description: ReadyNLBs is the number of ready NLB instances
+                type: integer
+              totalNLBs:
+                description: TotalNLBs is the total number of NLB instances
+                type: integer
+              totalServices:
+                description: TotalServices is the total number of pre-warmed Services
+                type: integer
+            required:
+            - availableServices
+            - boundServices
+            - readyNLBs
+            - totalNLBs
+            - totalServices
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
