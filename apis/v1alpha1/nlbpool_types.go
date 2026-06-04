@@ -1,116 +1,117 @@
 package v1alpha1
 
-import (
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-)
+import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-// NLBPoolPhase defines the phase of NLBPool
+// NLBPoolPhase
 type NLBPoolPhase string
 
 const (
-	NLBPoolPhasePending NLBPoolPhase = "Pending"
-	NLBPoolPhaseReady   NLBPoolPhase = "Ready"
-	NLBPoolPhaseFailed  NLBPoolPhase = "Failed"
+	NLBPoolPending      NLBPoolPhase = "Pending"
+	NLBPoolProvisioning NLBPoolPhase = "Provisioning"
+	NLBPoolReady        NLBPoolPhase = "Ready"
+	NLBPoolDeleting     NLBPoolPhase = "Deleting"
+	NLBPoolFailed       NLBPoolPhase = "Failed"
 )
+
+// LaneConfig 每条线路配置
+type LaneConfig struct {
+	// Name lane名称，用于CR命名
+	Name string `json:"name"`
+	// ISPType 线路类型: BGP, BGP_PRO, ChinaTelecom, ChinaUnicom, ChinaMobile
+	ISPType string `json:"ispType"`
+}
+
+// PortConfig 每Pod暴露的逻辑端口
+type PortConfig struct {
+	// Name 端口名称，用于CR命名
+	Name string `json:"name"`
+	// Protocol 协议: TCP, UDP, TCPSSL
+	Protocol string `json:"protocol"`
+	// ContainerPort 容器暴露的端口（后端服务器真实监听端口）
+	ContainerPort int32 `json:"containerPort,omitempty"`
+}
+
+// PortRange Listener端口范围
+type PortRange struct {
+	// Min 最小端口
+	Min int32 `json:"min"`
+	// Max 最大端口
+	Max int32 `json:"max"`
+}
+
+// ZoneMapEntry 可用区映射
+type ZoneMapEntry struct {
+	// Zone 可用区ID
+	Zone string `json:"zone"`
+	// VSwitchId 交换机ID
+	VSwitchId string `json:"vswitchId"`
+}
+
+// NLBHealthCheckConfig 健康检查配置
+type NLBHealthCheckConfig struct {
+	// Enabled 是否启用
+	Enabled bool `json:"enabled"`
+}
 
 // NLBPoolSpec defines the desired state of NLBPool
 type NLBPoolSpec struct {
-	// ZoneMaps defines VPC and zone mapping
-	// Format: "vpc-xxx@zone1:vswitch1,zone2:vswitch2"
-	ZoneMaps string `json:"zoneMaps"`
-
-	// MinPort is the minimum port for NLB Listener
-	MinPort int32 `json:"minPort"`
-
-	// MaxPort is the maximum port for NLB Listener
-	MaxPort int32 `json:"maxPort"`
-
-	// BlockPorts is the list of ports to skip
-	// +optional
-	BlockPorts []int32 `json:"blockPorts,omitempty"`
-
-	// PortsPerPod is the number of ports required per Pod
-	PortsPerPod int `json:"portsPerPod"`
-
-	// Protocols is the list of protocols for each port
-	Protocols []corev1.Protocol `json:"protocols"`
-
-	// EipIspTypes is the list of EIP ISP types
-	// e.g.: BGP, BGP_PRO, ChinaTelecom, ChinaUnicom, ChinaMobile
-	// +optional
-	EipIspTypes []string `json:"eipIspTypes,omitempty"`
-
-	// MinAvailable is the minimum number of available (unbound) Services to maintain
-	// When available count drops below this value, Controller automatically creates new NLBs
-	MinAvailable int `json:"minAvailable"`
-
-	// ExternalTrafficPolicy defines the traffic policy for Service
-	// +optional
-	ExternalTrafficPolicy corev1.ServiceExternalTrafficPolicyType `json:"externalTrafficPolicy,omitempty"`
-
-	// HealthCheck defines NLB health check configuration
-	// +optional
+	// Region 阿里云区域
+	Region string `json:"region"`
+	// VpcId VPC ID
+	VpcId string `json:"vpcId"`
+	// ZoneMaps NLB需要的可用区和交换机
+	ZoneMaps []ZoneMapEntry `json:"zoneMaps"`
+	// Lanes 每条线路配置（取代eipIspTypes数组）
+	Lanes []LaneConfig `json:"lanes"`
+	// Ports 每Pod暴露的逻辑端口（取代portsPerPod + protocols）
+	Ports []PortConfig `json:"ports"`
+	// PortRange Listener端口范围
+	PortRange PortRange `json:"portRange"`
+	// SlotsPerNLB 每个NLB实例承载的slot数
+	SlotsPerNLB int32 `json:"slotsPerNLB"`
+	// MinAvailableNLBs 最小空闲NLB实例数（以NLB为粒度预热）
+	MinAvailableNLBs int32 `json:"minAvailableNLBs"`
+	// HealthCheck NLB健康检查配置
 	HealthCheck *NLBHealthCheckConfig `json:"healthCheck,omitempty"`
-
-	// SecurityProtectionTypes defines EIP security protection types
-	// +optional
-	SecurityProtectionTypes []string `json:"securityProtectionTypes,omitempty"`
 }
 
-// NLBHealthCheckConfig defines health check configuration
-type NLBHealthCheckConfig struct {
-	// Flag is the health check switch (on/off)
-	Flag string `json:"flag,omitempty"`
-	// Type is the health check type (tcp/http)
-	Type string `json:"type,omitempty"`
-	// ConnectPort is the health check port
-	ConnectPort string `json:"connectPort,omitempty"`
-	// ConnectTimeout is the connection timeout
-	ConnectTimeout string `json:"connectTimeout,omitempty"`
-	// Interval is the check interval
-	Interval string `json:"interval,omitempty"`
-	// Uri is the HTTP health check path
-	Uri string `json:"uri,omitempty"`
-	// Domain is the HTTP health check domain
-	Domain string `json:"domain,omitempty"`
-	// Method is the HTTP health check method
-	Method string `json:"method,omitempty"`
-	// HealthyThreshold is the healthy threshold
-	HealthyThreshold string `json:"healthyThreshold,omitempty"`
-	// UnhealthyThreshold is the unhealthy threshold
-	UnhealthyThreshold string `json:"unhealthyThreshold,omitempty"`
+// LaneStatus 每条lane的状态
+type LaneStatus struct {
+	// Name lane名称
+	Name string `json:"name"`
+	// NLBId 云端NLB ID
+	NLBId string `json:"nlbId,omitempty"`
+	// EIP 公网IP
+	EIP string `json:"eip,omitempty"`
+	// Ready 是否就绪
+	Ready bool `json:"ready"`
 }
 
 // NLBPoolStatus defines the observed state of NLBPool
 type NLBPoolStatus struct {
-	// Phase is the current phase of NLBPool
+	// Phase 当前阶段
 	Phase NLBPoolPhase `json:"phase,omitempty"`
-
-	// TotalNLBs is the total number of NLB instances
-	TotalNLBs int `json:"totalNLBs"`
-
-	// ReadyNLBs is the number of ready NLB instances
-	ReadyNLBs int `json:"readyNLBs"`
-
-	// TotalServices is the total number of pre-warmed Services
-	TotalServices int `json:"totalServices"`
-
-	// AvailableServices is the number of available (unbound) Services
-	AvailableServices int `json:"availableServices"`
-
-	// BoundServices is the number of bound Services
-	BoundServices int `json:"boundServices"`
+	// Lanes 每条lane的状态
+	Lanes []LaneStatus `json:"lanes,omitempty"`
+	// NLBsPerLane 每条lane当前的NLB数
+	NLBsPerLane int32 `json:"nlbsPerLane,omitempty"`
+	// TotalSlots 总slot数
+	TotalSlots int32 `json:"totalSlots,omitempty"`
+	// AvailableSlots 可用slot数
+	AvailableSlots int32 `json:"availableSlots,omitempty"`
+	// BoundSlots 已绑定slot数
+	BoundSlots int32 `json:"boundSlots,omitempty"`
+	// Message 附加信息
+	Message string `json:"message,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
-// +kubebuilder:printcolumn:name="NLBs",type=integer,JSONPath=`.status.totalNLBs`
-// +kubebuilder:printcolumn:name="Available",type=integer,JSONPath=`.status.availableServices`
-// +kubebuilder:printcolumn:name="Bound",type=integer,JSONPath=`.status.boundServices`
-
-// NLBPool is the Schema for the nlbpools API
+// +kubebuilder:printcolumn:name="Total",type=integer,JSONPath=`.status.totalSlots`
+// +kubebuilder:printcolumn:name="Available",type=integer,JSONPath=`.status.availableSlots`
+// +kubebuilder:printcolumn:name="Bound",type=integer,JSONPath=`.status.boundSlots`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 type NLBPool struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -120,8 +121,6 @@ type NLBPool struct {
 }
 
 // +kubebuilder:object:root=true
-
-// NLBPoolList contains a list of NLBPool
 type NLBPoolList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`

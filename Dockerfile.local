@@ -1,0 +1,6 @@
+FROM registry.cn-hangzhou.aliyuncs.com/acs/alpine:3.18-update
+RUN apk --no-cache add ca-certificates bash
+WORKDIR /
+COPY manager .
+USER 65532:65532
+ENTRYPOINT ["/manager"]
