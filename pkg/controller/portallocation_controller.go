@@ -1040,6 +1040,7 @@ func (r *PortAllocationReconciler) handleBinding(ctx context.Context, pa *nlbpoo
 		return r.resetToAvailable(ctx, pa, "Pod claim mismatch before cloud API call")
 	}
 
+	var addThrottled bool
 	for _, sgRef := range pa.Spec.ServerGroups {
 		if sgRef.ServerGroupId == "" {
 			// SG ID not yet synced from the SG CR; wait.
@@ -1063,22 +1064,23 @@ func (r *PortAllocationReconciler) handleBinding(ctx context.Context, pa *nlbpoo
 			ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "add", sgRef.ServerGroupId, pa.Spec.BoundPodIP),
 		}
 		if _, err := r.NLBClient.AddServersToServerGroup(ctx, req); err != nil {
-			if provider.IsLocalRateLimited(err) {
-				return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
-			}
-			if isThrottlingError(err) {
-				r.eventf(pa, corev1.EventTypeWarning, "Throttled",
-					"API throttled for SG %s, will retry", sgRef.ServerGroupId)
-				return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
-			}
-			if isDuplicatedServerError(err) {
-				// Already in the SG: idempotent success.
+			if provider.IsLocalRateLimited(err) || isThrottlingError(err) || isDuplicatedServerError(err) {
+				// Throttle/duplicate/local-rate-limit: continue to next SG.
+				// ClientToken ensures idempotency; previously-throttled calls
+				// that actually succeeded will return DuplicatedServer on retry.
+				if isThrottlingError(err) || provider.IsLocalRateLimited(err) {
+					addThrottled = true
+				}
 				continue
 			}
 			r.eventf(pa, corev1.EventTypeWarning, "AddServerFailed",
 				"Failed to add server to SG %s: %v", sgRef.ServerGroupId, err)
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
+	}
+	if addThrottled {
+		// At least one SG was throttled; requeue to verify all succeeded.
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
 	pa.Status.Phase = nlbpoolv1alpha1.PortAllocationBound
