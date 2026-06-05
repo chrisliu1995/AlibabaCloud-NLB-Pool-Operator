@@ -171,6 +171,9 @@ func (r *PortAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 // ---------------------------------------------------------------------------
 
 func (r *PortAllocationReconciler) handleDeletion(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	logger.Info("handleDeletion", "pa", pa.Name, "phase", pa.Status.Phase)
+
 	if !controllerutil.ContainsFinalizer(pa, nlbpoolv1alpha1.FinalizerPortAllocation) {
 		return ctrl.Result{}, nil
 	}
@@ -184,6 +187,7 @@ func (r *PortAllocationReconciler) handleDeletion(ctx context.Context, pa *nlbpo
 	}
 
 	// 2. Delete Listeners (must delete Listeners before SGs because Listeners reference SGs).
+	logger.Info("handleDeletion step 2: delete listeners", "count", len(pa.Status.Listeners))
 	var remainingListeners []nlbpoolv1alpha1.ListenerCloudStatus
 	for _, lsn := range pa.Status.Listeners {
 		if lsn.ListenerId == "" {
@@ -215,13 +219,32 @@ func (r *PortAllocationReconciler) handleDeletion(ctx context.Context, pa *nlbpo
 	pa.Status.ListenersTotal = 0
 
 	// 3. Delete ServerGroups.
+	logger.Info("handleDeletion step 3: delete SGs", "count", len(pa.Status.ServerGroups))
 	var remainingSGs []nlbpoolv1alpha1.ServerGroupCloudStatus
 	for _, sg := range pa.Status.ServerGroups {
 		if sg.ServerGroupId == "" {
 			continue
 		}
 		if err := r.NLBClient.DeleteServerGroup(ctx, sg.ServerGroupId); err != nil {
+			logger.Info("DeleteServerGroup error", "sg", sg.ServerGroupId, "err", err.Error())
 			if !provider.IsNotFoundError(err) {
+				// ResourceInUse means Listeners still reference this SG. PA.Status.Listeners
+				// may have been cleared by an interrupted earlier deletion (e.g. Throttling),
+				// so step 2 found nothing while orphan listeners still live on the cloud.
+				// Discover and delete those orphan listeners by NLB+port, then requeue so
+				// the next pass can drop the SG.
+				if strings.Contains(err.Error(), "ResourceInUse") {
+					if cleanupErr := r.cleanupOrphanListeners(ctx, pa); cleanupErr != nil {
+						logger.Error(cleanupErr, "cleanupOrphanListeners failed", "sg", sg.ServerGroupId)
+						if provider.IsLocalRateLimited(cleanupErr) {
+							return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+						}
+						if isThrottlingError(cleanupErr) {
+							return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+						}
+					}
+					return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+				}
 				remainingSGs = append(remainingSGs, sg)
 				if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
 					pa.Status.ServerGroups = remainingSGs
@@ -237,13 +260,8 @@ func (r *PortAllocationReconciler) handleDeletion(ctx context.Context, pa *nlbpo
 			}
 		}
 	}
-	// All SGs deleted, clear the list
-	pa.Status.ServerGroups = nil
-	pa.Status.SGsReady = 0
-	pa.Status.SGsTotal = 0
-	_ = r.Status().Update(ctx, pa)
-
-	// 4. All cloud resources cleaned up, remove finalizer.
+	// All SGs deleted (or NotFound), cloud resources are cleaned up.
+	// Remove finalizer directly - PA is about to be garbage collected, status cleanup is best-effort.
 	controllerutil.RemoveFinalizer(pa, nlbpoolv1alpha1.FinalizerPortAllocation)
 	if err := r.Update(ctx, pa); err != nil {
 		if errors.IsConflict(err) {
@@ -251,7 +269,84 @@ func (r *PortAllocationReconciler) handleDeletion(ctx context.Context, pa *nlbpo
 		}
 		return ctrl.Result{}, err
 	}
+	logger.Info("PA deletion completed", "pa", pa.Name)
 	return ctrl.Result{}, nil
+}
+
+// cleanupOrphanListeners discovers and deletes any cloud Listeners that this PA
+// owns by (NLB, port) but no longer tracks in pa.Status.Listeners. Used during
+// handleDeletion when DeleteServerGroup returns ResourceInUse.ServerGroup,
+// which signals that an earlier listener-deletion pass was interrupted before
+// the cloud-side resource was actually removed.
+func (r *PortAllocationReconciler) cleanupOrphanListeners(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation) error {
+	logger := log.FromContext(ctx)
+
+	poolName := pa.Labels[nlbpoolv1alpha1.LabelPool]
+	slotLabel := pa.Labels[nlbpoolv1alpha1.LabelSlot]
+	if poolName == "" || slotLabel == "" {
+		return fmt.Errorf("pa %s missing pool/slot labels", pa.Name)
+	}
+	slotIdxInt, err := strconv.Atoi(slotLabel)
+	if err != nil {
+		return fmt.Errorf("invalid slot label %q: %w", slotLabel, err)
+	}
+	slotIdx := int32(slotIdxInt)
+
+	pool := &nlbpoolv1alpha1.NLBPool{}
+	if err := r.Get(ctx, types.NamespacedName{Name: poolName, Namespace: pa.Namespace}, pool); err != nil {
+		return fmt.Errorf("get pool %s: %w", poolName, err)
+	}
+	if pool.Spec.SlotsPerNLB <= 0 || len(pool.Spec.Lanes) == 0 || len(pool.Spec.Ports) == 0 {
+		return nil
+	}
+
+	nlbGroupIdx := slotIdx / pool.Spec.SlotsPerNLB
+	slotInGroup := slotIdx % pool.Spec.SlotsPerNLB
+	portCount := int32(len(pool.Spec.Ports))
+
+	for _, lane := range pool.Spec.Lanes {
+		nlbName := fmt.Sprintf("%s-%s-%d", pool.Name, lane.Name, nlbGroupIdx)
+		nlbCR := &nlbv1.NLB{}
+		if err := r.Get(ctx, types.NamespacedName{Name: nlbName, Namespace: pa.Namespace}, nlbCR); err != nil {
+			logger.Info("cleanupOrphanListeners: skip lane (NLB CR unavailable)",
+				"name", nlbName, "err", err.Error())
+			continue
+		}
+		nlbId := nlbCR.Status.LoadBalancerId
+		if nlbId == "" {
+			continue
+		}
+
+		for portIdx := range pool.Spec.Ports {
+			listenerPort := pool.Spec.PortRange.Min + slotInGroup*portCount + int32(portIdx)
+			existingId, listErr := r.NLBClient.ListListenersByPort(ctx, nlbId, listenerPort)
+			if listErr != nil {
+				if provider.IsLocalRateLimited(listErr) || isThrottlingError(listErr) {
+					return listErr
+				}
+				logger.Info("cleanupOrphanListeners: ListListenersByPort failed",
+					"nlbId", nlbId, "port", listenerPort, "err", listErr.Error())
+				continue
+			}
+			if existingId == "" {
+				continue
+			}
+			// ListListeners API returns ListenerId in "lsn-xxx@port" form; strip the suffix.
+			if at := strings.Index(existingId, "@"); at > 0 {
+				existingId = existingId[:at]
+			}
+			if delErr := r.NLBClient.DeleteListener(ctx, existingId); delErr != nil {
+				if provider.IsNotFoundError(delErr) {
+					continue
+				}
+				return fmt.Errorf("delete orphan listener %s on nlb %s port %d: %w",
+					existingId, nlbId, listenerPort, delErr)
+			}
+			r.eventf(pa, corev1.EventTypeNormal, "OrphanListenerDeleted",
+				"Deleted orphan listener %s on NLB %s port %d", existingId, nlbId, listenerPort)
+		}
+	}
+	return nil
 }
 
 // handleProvisioning directly creates cloud ServerGroups and Listeners via NLB API,
@@ -957,8 +1052,8 @@ func (r *PortAllocationReconciler) handleBound(ctx context.Context, pa *nlbpoolv
 		return r.startReleasing(ctx, pa)
 	}
 
-	// Binding is stable.
-	return ctrl.Result{}, nil
+	// Binding is stable. Periodic requeue to detect Pod deletion if watch event is lost.
+	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
 func (r *PortAllocationReconciler) handleReleasing(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation) (ctrl.Result, error) {
@@ -967,11 +1062,19 @@ func (r *PortAllocationReconciler) handleReleasing(ctx context.Context, pa *nlbp
 			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 		}
 		if isThrottlingError(err) {
-			return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+			// If stuck in Releasing for too long (Pod is gone anyway), skip RemoveServers
+			if pa.Status.Message != "" && time.Since(pa.CreationTimestamp.Time) > 5*time.Minute {
+				log.FromContext(ctx).Info("Skipping RemoveServers after prolonged throttling (pod already gone)", "pa", pa.Name)
+			} else {
+				return ctrl.Result{RequeueAfter: 30*time.Second + time.Duration(pa.UID[0]%30)*time.Second}, nil
+			}
+		} else if isDuplicatedServerError(err) || isServerNotFoundError(err) {
+			// Server already removed or not found - safe to proceed
+		} else {
+			r.eventf(pa, corev1.EventTypeWarning, "RemoveServerFailed",
+				"Failed to remove servers: %v", err)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
-		r.eventf(pa, corev1.EventTypeWarning, "RemoveServerFailed",
-			"Failed to remove servers: %v", err)
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	// Best-effort: clear stale Pod claim annotation so the slot can be reused.
 	r.clearPodClaim(ctx, pa)
@@ -1286,7 +1389,8 @@ func isServerNotFoundError(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "ServerNotFound") ||
 		strings.Contains(msg, "InvalidParam.Server") ||
-		strings.Contains(msg, "ResourceNotFound.Server")
+		strings.Contains(msg, "ResourceNotFound.Server") ||
+		strings.Contains(msg, "ResourceNotFound.BackendServer")
 }
 
 // ---------------------------------------------------------------------------
