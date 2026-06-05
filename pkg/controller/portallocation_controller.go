@@ -331,10 +331,6 @@ func (r *PortAllocationReconciler) cleanupOrphanListeners(ctx context.Context, p
 			if existingId == "" {
 				continue
 			}
-			// ListListeners API returns ListenerId in "lsn-xxx@port" form; strip the suffix.
-			if at := strings.Index(existingId, "@"); at > 0 {
-				existingId = existingId[:at]
-			}
 			if delErr := r.NLBClient.DeleteListener(ctx, existingId); delErr != nil {
 				if provider.IsNotFoundError(delErr) {
 					continue
@@ -522,7 +518,14 @@ func (r *PortAllocationReconciler) handleProvisioning(ctx context.Context, pa *n
 
 			// Create Listener directly (ClientToken ensures idempotency)
 			port := pool.Spec.Ports[portIdx]
-			clientToken := r.provisioningClientToken(pa, "lsn", port.Name, lane.Name)
+			tokenPrefix := "lsn"
+			for _, l := range pa.Status.Listeners {
+				if l.Phase == "Running" {
+					tokenPrefix = "lsn-recreate"
+					break
+				}
+			}
+			clientToken := r.provisioningClientToken(pa, tokenPrefix, port.Name, lane.Name)
 			resp, err := r.NLBClient.CreateListener(ctx, &provider.CreateListenerRequest{
 				LoadBalancerId:   nlbId,
 				ListenerProtocol: port.Protocol,
@@ -548,10 +551,6 @@ func (r *PortAllocationReconciler) handleProvisioning(ctx context.Context, pa *n
 					// Fallback: retrieve existing listener ID
 					existingId, listErr := r.NLBClient.ListListenersByPort(ctx, nlbId, listenerPort)
 					if listErr == nil && existingId != "" {
-						// Strip @port suffix if present
-						if idx := strings.Index(existingId, "@"); idx > 0 {
-							existingId = existingId[:idx]
-						}
 						if pErr := r.patchListenerStatus(ctx, pa, i, existingId, "Creating"); pErr != nil {
 							return ctrl.Result{Requeue: true}, nil
 						}
@@ -586,10 +585,81 @@ func (r *PortAllocationReconciler) handleProvisioning(ctx context.Context, pa *n
 				if isThrottlingError(err) {
 					return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 				}
+				if provider.IsNotFoundError(err) {
+					logger.Info("Listener disappeared during Creating, resetting to Pending for re-creation",
+						"listenerId", lsn.ListenerId)
+					if pErr := r.patchListenerStatus(ctx, pa, i, "", "Pending"); pErr != nil {
+						return ctrl.Result{Requeue: true}, nil
+					}
+					pa.Status.Listeners[i].ListenerId = ""
+					pa.Status.Listeners[i].Phase = "Pending"
+					allListenersRunning = false
+					continue
+				}
 				logger.Error(err, "GetListenerAttribute failed", "listenerId", lsn.ListenerId)
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
-			if attr != nil && attr.ListenerStatus == "Running" {
+			if attr == nil {
+				// Listener not found by stored ID — try to find it by NLB+port
+				// (likely the stored ID is missing the @port suffix)
+				nlbName := fmt.Sprintf("%s-%s-%d", pool.Name, lane.Name, nlbGroupIdx)
+				nlbCR := &nlbv1.NLB{}
+				if err := r.Get(ctx, types.NamespacedName{Name: nlbName, Namespace: pa.Namespace}, nlbCR); err != nil {
+					logger.Error(err, "Get NLB CR failed", "name", nlbName)
+					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+				}
+				nlbId := nlbCR.Status.LoadBalancerId
+				if nlbId == "" {
+					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+				}
+
+				existingId, listErr := r.NLBClient.ListListenersByPort(ctx, nlbId, lsn.ListenerPort)
+				if listErr == nil && existingId != "" {
+					// Found existing listener — fix the stored ID
+					logger.Info("Listener found by port lookup, fixing stored ID",
+						"oldId", lsn.ListenerId, "correctId", existingId)
+					if pErr := r.patchListenerStatus(ctx, pa, i, existingId, "Creating"); pErr != nil {
+						return ctrl.Result{Requeue: true}, nil
+					}
+					pa.Status.Listeners[i].ListenerId = existingId
+					allListenersRunning = false
+					continue
+				}
+
+				// Listener truly doesn't exist — re-create
+				logger.Info("Listener not found on cloud, re-creating",
+					"oldListenerId", lsn.ListenerId)
+				sgId := pa.Status.ServerGroups[portIdx].ServerGroupId
+				port := pool.Spec.Ports[portIdx]
+				clientToken := r.provisioningClientToken(pa, "lsn-recreate", port.Name, lane.Name)
+				resp, createErr := r.NLBClient.CreateListener(ctx, &provider.CreateListenerRequest{
+					LoadBalancerId:   nlbId,
+					ListenerProtocol: port.Protocol,
+					ListenerPort:     lsn.ListenerPort,
+					ServerGroupId:    sgId,
+					ClientToken:      clientToken,
+				})
+				if createErr != nil {
+					if provider.IsLocalRateLimited(createErr) {
+						return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+					}
+					if isThrottlingError(createErr) {
+						return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+					}
+					if isIncorrectStatusError(createErr) {
+						return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+					}
+					logger.Error(createErr, "Re-CreateListener failed", "nlbId", nlbId, "port", lsn.ListenerPort)
+					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+				}
+				newId := resp.ListenerId
+				logger.Info("Re-created listener successfully", "oldId", lsn.ListenerId, "newId", newId)
+				if pErr := r.patchListenerStatus(ctx, pa, i, newId, "Creating"); pErr != nil {
+					return ctrl.Result{Requeue: true}, nil
+				}
+				pa.Status.Listeners[i].ListenerId = newId
+				allListenersRunning = false
+			} else if attr.ListenerStatus == "Running" {
 				if err := r.patchListenerStatus(ctx, pa, i, lsn.ListenerId, "Running"); err != nil {
 					return ctrl.Result{Requeue: true}, nil
 				}
