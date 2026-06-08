@@ -114,6 +114,8 @@ type PortAllocationStatus struct {
 	ServerGroups []ServerGroupCloudStatus `json:"serverGroups,omitempty"`
 	// Listeners 记录每个 (port, lane) 对应的云端 Listener 信息
 	Listeners []ListenerCloudStatus `json:"listeners,omitempty"`
+	// RegisteredSGs 记录已成功调用 AddServer 的 SG ID 集合（Binding 阶段跳过已注册的 SG）
+	RegisteredSGs []string `json:"registeredSGs,omitempty"`
 	// SGsReady 已就绪的 SG 数量
 	SGsReady int32 `json:"sgsReady,omitempty"`
 	// SGsTotal 总 SG 数量
