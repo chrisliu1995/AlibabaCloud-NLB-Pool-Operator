@@ -1148,26 +1148,73 @@ func (r *PortAllocationReconciler) handleBound(ctx context.Context, pa *nlbpoolv
 }
 
 func (r *PortAllocationReconciler) handleReleasing(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation) (ctrl.Result, error) {
-	if err := r.removeServers(ctx, pa); err != nil {
-		if provider.IsLocalRateLimited(err) {
-			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+	if pa.Spec.BoundPodIP == "" {
+		r.clearPodClaim(ctx, pa)
+		return r.resetToAvailable(ctx, pa, "Released, ready for rebinding")
+	}
+
+	remaining := make(map[string]bool, len(pa.Status.RegisteredSGs))
+	for _, id := range pa.Status.RegisteredSGs {
+		remaining[id] = true
+	}
+
+	var removeThrottled bool
+	var removed []string
+	for sgID := range remaining {
+		port := r.lookupContainerPortForSGById(pa, sgID)
+		req := &provider.RemoveServersRequest{
+			ServerGroupId: sgID,
+			Servers: []provider.BackendServer{{
+				ServerType: "Ip",
+				ServerId:   pa.Spec.BoundPodIP,
+				ServerIp:   pa.Spec.BoundPodIP,
+				Port:       port,
+				Weight:     100,
+			}},
+			ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "remove", sgID, pa.Spec.BoundPodIP),
 		}
-		if isThrottlingError(err) {
-			// If stuck in Releasing for too long (Pod is gone anyway), skip RemoveServers
-			if pa.Status.Message != "" && time.Since(pa.CreationTimestamp.Time) > 5*time.Minute {
-				log.FromContext(ctx).Info("Skipping RemoveServers after prolonged throttling (pod already gone)", "pa", pa.Name)
-			} else {
-				return ctrl.Result{RequeueAfter: 30*time.Second + time.Duration(pa.UID[0]%30)*time.Second}, nil
+		if _, err := r.NLBClient.RemoveServersFromServerGroup(ctx, req); err != nil {
+			if isServerNotFoundError(err) || isDuplicatedServerError(err) {
+				removed = append(removed, sgID)
+				continue
 			}
-		} else if isDuplicatedServerError(err) || isServerNotFoundError(err) {
-			// Server already removed or not found - safe to proceed
-		} else {
+			if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
+				removeThrottled = true
+				continue
+			}
 			r.eventf(pa, corev1.EventTypeWarning, "RemoveServerFailed",
-				"Failed to remove servers: %v", err)
+				"Failed to remove server from SG %s: %v", sgID, err)
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
+		removed = append(removed, sgID)
 	}
-	// Best-effort: clear stale Pod claim annotation so the slot can be reused.
+
+	if len(removed) > 0 {
+		newList := make([]string, 0, len(pa.Status.RegisteredSGs)-len(removed))
+		removedSet := make(map[string]bool, len(removed))
+		for _, id := range removed {
+			removedSet[id] = true
+		}
+		for _, id := range pa.Status.RegisteredSGs {
+			if !removedSet[id] {
+				newList = append(newList, id)
+			}
+		}
+		patch := client.MergeFrom(pa.DeepCopy())
+		pa.Status.RegisteredSGs = newList
+		if err := r.Status().Patch(ctx, pa, patch); err != nil {
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+	}
+
+	if removeThrottled {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	if len(pa.Status.RegisteredSGs) > 0 {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
 	r.clearPodClaim(ctx, pa)
 	return r.resetToAvailable(ctx, pa, "Released, ready for rebinding")
 }
@@ -1290,11 +1337,13 @@ func (r *PortAllocationReconciler) clearClaim(ctx context.Context, pa *nlbpoolv1
 }
 
 // removeServers calls RemoveServersFromServerGroup for every SG attached to
-// the PA. Idempotent: ServerNotFound errors are swallowed.
+// the PA. Throttle/rate-limit errors continue to next SG; only hard errors
+// are returned. Returns a throttle sentinel if any SG was skipped.
 func (r *PortAllocationReconciler) removeServers(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation) error {
 	if pa.Spec.BoundPodIP == "" {
 		return nil
 	}
+	var removeThrottled bool
 	for _, sgRef := range pa.Spec.ServerGroups {
 		if sgRef.ServerGroupId == "" {
 			continue
@@ -1312,11 +1361,18 @@ func (r *PortAllocationReconciler) removeServers(ctx context.Context, pa *nlbpoo
 			ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "remove", sgRef.ServerGroupId, pa.Spec.BoundPodIP),
 		}
 		if _, err := r.NLBClient.RemoveServersFromServerGroup(ctx, req); err != nil {
-			if isServerNotFoundError(err) {
+			if isServerNotFoundError(err) || isDuplicatedServerError(err) {
+				continue
+			}
+			if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
+				removeThrottled = true
 				continue
 			}
 			return err
 		}
+	}
+	if removeThrottled {
+		return provider.ErrLocalRateLimited
 	}
 	return nil
 }
@@ -1368,6 +1424,15 @@ func (r *PortAllocationReconciler) lookupContainerPortForSG(pa *nlbpoolv1alpha1.
 					return p.ListenerPort
 				}
 			}
+		}
+	}
+	return 0
+}
+
+func (r *PortAllocationReconciler) lookupContainerPortForSGById(pa *nlbpoolv1alpha1.PortAllocation, sgId string) int32 {
+	for _, sg := range pa.Spec.ServerGroups {
+		if sg.ServerGroupId == sgId {
+			return r.lookupContainerPortForSG(pa, sg.Name)
 		}
 	}
 	return 0
