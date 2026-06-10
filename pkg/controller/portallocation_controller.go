@@ -907,25 +907,8 @@ func (r *PortAllocationReconciler) handleAvailable(ctx context.Context, pa *nlbp
 	// --- Step 2: CAS write Pod annotation (confirm the binding) ---
 	// Use optimistic locking (Update with resourceVersion) so that if another
 	// PA concurrently writes the annotation, one of them gets a Conflict error.
-	// Additionally, check if the annotation was already set by someone else
-	// between our List and now (read-modify-write with conflict detection).
 	if candidate.Annotations == nil {
 		candidate.Annotations = map[string]string{}
-	}
-	existingClaim := candidate.Annotations[nlbpoolv1alpha1.AnnotationPAClaim]
-	if existingClaim != "" && existingClaim != pa.Name {
-		// Another PA already claimed this Pod before us. Roll back.
-		r.eventf(pa, corev1.EventTypeNormal, "PodAlreadyClaimed",
-			"Pod %s already claimed by %s, rolling back", candidate.Name, existingClaim)
-		pa.Spec.BoundPod = ""
-		pa.Spec.BoundPodIP = ""
-		if updateErr := r.Update(ctx, pa); updateErr != nil {
-			if errors.IsConflict(updateErr) {
-				return ctrl.Result{Requeue: true}, nil
-			}
-			return ctrl.Result{}, updateErr
-		}
-		return ctrl.Result{Requeue: true}, nil
 	}
 	candidate.Annotations[nlbpoolv1alpha1.AnnotationPAClaim] = pa.Name
 	if err := r.Update(ctx, candidate); err != nil {
