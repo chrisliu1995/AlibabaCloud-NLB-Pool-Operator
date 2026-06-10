@@ -42,8 +42,10 @@ type ServerGroupCloudStatus struct {
 	Name string `json:"name"`
 	// ServerGroupId 云端 SG ID
 	ServerGroupId string `json:"serverGroupId,omitempty"`
-	// Phase: Pending / Creating / Active
+	// Phase: Pending / Creating / Active (SG 自身生命周期)
 	Phase string `json:"phase,omitempty"`
+	// ServerStatus: "" / Adding / Bound / Removing (backend server 绑定状态)
+	ServerStatus string `json:"serverStatus,omitempty"`
 }
 
 // ListenerCloudStatus 记录一个 Listener 的云端状态
@@ -114,8 +116,6 @@ type PortAllocationStatus struct {
 	ServerGroups []ServerGroupCloudStatus `json:"serverGroups,omitempty"`
 	// Listeners 记录每个 (port, lane) 对应的云端 Listener 信息
 	Listeners []ListenerCloudStatus `json:"listeners,omitempty"`
-	// RegisteredSGs 记录已成功调用 AddServer 的 SG ID 集合（Binding 阶段跳过已注册的 SG）
-	RegisteredSGs []string `json:"registeredSGs,omitempty"`
 	// SGsReady 已就绪的 SG 数量
 	SGsReady int32 `json:"sgsReady,omitempty"`
 	// SGsTotal 总 SG 数量

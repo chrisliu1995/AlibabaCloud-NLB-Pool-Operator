@@ -154,6 +154,34 @@ func (c *AlibabaNLBClient) RemoveServersFromServerGroup(ctx context.Context, req
 	}, nil
 }
 
+// ListServerGroupServers returns the backend servers registered in a ServerGroup.
+func (c *AlibabaNLBClient) ListServerGroupServers(ctx context.Context, serverGroupId string) ([]BackendServer, error) {
+	request := &nlbsdk.ListServerGroupServersRequest{
+		ServerGroupId: tea.String(serverGroupId),
+		MaxResults:    tea.Int32(100),
+		RegionId:      tea.String(c.region),
+	}
+
+	resp, err := c.client.ListServerGroupServers(request)
+	if err != nil {
+		return nil, fmt.Errorf("ListServerGroupServers API error: %w", err)
+	}
+	if resp == nil || resp.Body == nil {
+		return nil, fmt.Errorf("ListServerGroupServers: nil response body")
+	}
+
+	var servers []BackendServer
+	for _, s := range resp.Body.Servers {
+		servers = append(servers, BackendServer{
+			ServerType: tea.StringValue(s.ServerType),
+			ServerId:   tea.StringValue(s.ServerId),
+			ServerIp:   tea.StringValue(s.ServerIp),
+			Port:       tea.Int32Value(s.Port),
+		})
+	}
+	return servers, nil
+}
+
 // GetJobStatus polls the asynchronous job status.
 func (c *AlibabaNLBClient) GetJobStatus(ctx context.Context, jobId string) (string, error) {
 	request := &nlbsdk.GetJobStatusRequest{

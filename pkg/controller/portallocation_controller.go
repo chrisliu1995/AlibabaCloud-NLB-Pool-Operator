@@ -767,6 +767,27 @@ func (r *PortAllocationReconciler) patchSGStatus(ctx context.Context, pa *nlbpoo
 	return r.Status().Patch(ctx, pa, client.RawPatch(types.JSONPatchType, []byte(patch)))
 }
 
+// patchServerStatus uses JSON Patch to update a single SG's serverStatus at the given index.
+func (r *PortAllocationReconciler) patchServerStatus(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation, index int, serverStatus string) error {
+	patch := fmt.Sprintf(`[{"op":"replace","path":"/status/serverGroups/%d/serverStatus","value":"%s"}]`,
+		index, serverStatus)
+	return r.Status().Patch(ctx, pa, client.RawPatch(types.JSONPatchType, []byte(patch)))
+}
+
+// isServerInSG checks if the given IP is registered as a backend server in the SG.
+func (r *PortAllocationReconciler) isServerInSG(ctx context.Context, sgId, serverIp string) (bool, error) {
+	resp, err := r.NLBClient.ListServerGroupServers(ctx, sgId)
+	if err != nil {
+		return false, err
+	}
+	for _, s := range resp {
+		if s.ServerIp == serverIp {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // patchListenerStatus uses JSON Patch to update a single Listener's status at the given index.
 func (r *PortAllocationReconciler) patchListenerStatus(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation, index int, listenerId, phase string) error {
 	patch := fmt.Sprintf(`[{"op":"replace","path":"/status/listeners/%d/listenerId","value":"%s"},{"op":"replace","path":"/status/listeners/%d/phase","value":"%s"}]`,
@@ -1040,65 +1061,85 @@ func (r *PortAllocationReconciler) handleBinding(ctx context.Context, pa *nlbpoo
 		return r.resetToAvailable(ctx, pa, "Pod claim mismatch before cloud API call")
 	}
 
-	registered := make(map[string]bool, len(pa.Status.RegisteredSGs))
-	for _, id := range pa.Status.RegisteredSGs {
-		registered[id] = true
-	}
-
-	var addThrottled bool
-	var newlyRegistered []string
-	for _, sgRef := range pa.Spec.ServerGroups {
-		if sgRef.ServerGroupId == "" {
+	allBound := true
+	for i, sg := range pa.Status.ServerGroups {
+		if sg.ServerGroupId == "" {
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
-		if registered[sgRef.ServerGroupId] {
+
+		switch sg.ServerStatus {
+		case "Bound":
 			continue
-		}
-		port := r.lookupContainerPortForSG(pa, sgRef.Name)
-		if port == 0 {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
 
-		req := &provider.AddServersRequest{
-			ServerGroupId: sgRef.ServerGroupId,
-			Servers: []provider.BackendServer{{
-				ServerType: "Ip",
-				ServerId:   pa.Spec.BoundPodIP,
-				ServerIp:   pa.Spec.BoundPodIP,
-				Port:       port,
-				Weight:     100,
-			}},
-			ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "add", sgRef.ServerGroupId, pa.Spec.BoundPodIP),
-		}
-		if _, err := r.NLBClient.AddServersToServerGroup(ctx, req); err != nil {
-			if isDuplicatedServerError(err) {
-				newlyRegistered = append(newlyRegistered, sgRef.ServerGroupId)
-				continue
+		case "Adding":
+			// Poll: check if server actually exists in cloud SG
+			found, err := r.isServerInSG(ctx, sg.ServerGroupId, pa.Spec.BoundPodIP)
+			if err != nil {
+				if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
+					allBound = false
+					continue
+				}
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
-			if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
-				addThrottled = true
-				continue
+			if found {
+				if err := r.patchServerStatus(ctx, pa, i, "Bound"); err != nil {
+					return ctrl.Result{Requeue: true}, nil
+				}
+				pa.Status.ServerGroups[i].ServerStatus = "Bound"
+			} else {
+				// Server not found — reset to retry AddServer next reconcile
+				if err := r.patchServerStatus(ctx, pa, i, ""); err != nil {
+					return ctrl.Result{Requeue: true}, nil
+				}
+				pa.Status.ServerGroups[i].ServerStatus = ""
+				allBound = false
 			}
-			r.eventf(pa, corev1.EventTypeWarning, "AddServerFailed",
-				"Failed to add server to SG %s: %v", sgRef.ServerGroupId, err)
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+
+		default: // "" or "None" or "Removing" — need to (re-)add
+			port := r.lookupContainerPortForSG(pa, sg.Name)
+			if port == 0 {
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			req := &provider.AddServersRequest{
+				ServerGroupId: sg.ServerGroupId,
+				Servers: []provider.BackendServer{{
+					ServerType: "Ip",
+					ServerId:   pa.Spec.BoundPodIP,
+					ServerIp:   pa.Spec.BoundPodIP,
+					Port:       port,
+					Weight:     100,
+				}},
+				ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "add", sg.ServerGroupId, pa.Spec.BoundPodIP, pa.ResourceVersion),
+			}
+			if _, err := r.NLBClient.AddServersToServerGroup(ctx, req); err != nil {
+				if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
+					// Request rejected, don't change status, retry next reconcile
+					allBound = false
+					continue
+				}
+				if isDuplicatedServerError(err) {
+					// Server already exists, mark Adding to verify via List
+					if err := r.patchServerStatus(ctx, pa, i, "Adding"); err != nil {
+						return ctrl.Result{Requeue: true}, nil
+					}
+					pa.Status.ServerGroups[i].ServerStatus = "Adding"
+					allBound = false
+					continue
+				}
+				r.eventf(pa, corev1.EventTypeWarning, "AddServerFailed",
+					"Failed to add server to SG %s: %v", sg.ServerGroupId, err)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			// API accepted, mark Adding (will verify next reconcile)
+			if err := r.patchServerStatus(ctx, pa, i, "Adding"); err != nil {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			pa.Status.ServerGroups[i].ServerStatus = "Adding"
+			allBound = false
 		}
-		newlyRegistered = append(newlyRegistered, sgRef.ServerGroupId)
 	}
 
-	if len(newlyRegistered) > 0 {
-		patch := client.MergeFrom(pa.DeepCopy())
-		pa.Status.RegisteredSGs = append(pa.Status.RegisteredSGs, newlyRegistered...)
-		if err := r.Status().Patch(ctx, pa, patch); err != nil {
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-		}
-	}
-
-	if addThrottled {
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-	}
-
-	if len(pa.Status.RegisteredSGs) < len(pa.Spec.ServerGroups) {
+	if !allBound {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
@@ -1153,65 +1194,88 @@ func (r *PortAllocationReconciler) handleReleasing(ctx context.Context, pa *nlbp
 		return r.resetToAvailable(ctx, pa, "Released, ready for rebinding")
 	}
 
-	remaining := make(map[string]bool, len(pa.Status.RegisteredSGs))
-	for _, id := range pa.Status.RegisteredSGs {
-		remaining[id] = true
-	}
-
-	var removeThrottled bool
-	var removed []string
-	for sgID := range remaining {
-		port := r.lookupContainerPortForSGById(pa, sgID)
-		req := &provider.RemoveServersRequest{
-			ServerGroupId: sgID,
-			Servers: []provider.BackendServer{{
-				ServerType: "Ip",
-				ServerId:   pa.Spec.BoundPodIP,
-				ServerIp:   pa.Spec.BoundPodIP,
-				Port:       port,
-				Weight:     100,
-			}},
-			ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "remove", sgID, pa.Spec.BoundPodIP),
+	allClear := true
+	for i, sg := range pa.Status.ServerGroups {
+		if sg.ServerGroupId == "" {
+			continue
 		}
-		if _, err := r.NLBClient.RemoveServersFromServerGroup(ctx, req); err != nil {
-			if isServerNotFoundError(err) || isDuplicatedServerError(err) {
-				removed = append(removed, sgID)
-				continue
+
+		switch sg.ServerStatus {
+		case "", "None":
+			continue
+
+		case "Removing":
+			// Poll: check if server is actually gone from cloud SG
+			found, err := r.isServerInSG(ctx, sg.ServerGroupId, pa.Spec.BoundPodIP)
+			if err != nil {
+				if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
+					allClear = false
+					continue
+				}
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
-			if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
-				removeThrottled = true
-				continue
+			if !found {
+				if err := r.patchServerStatus(ctx, pa, i, ""); err != nil {
+					return ctrl.Result{Requeue: true}, nil
+				}
+				pa.Status.ServerGroups[i].ServerStatus = ""
+			} else {
+				// Server still exists — reset to retry RemoveServer next reconcile
+				if err := r.patchServerStatus(ctx, pa, i, "Bound"); err != nil {
+					return ctrl.Result{Requeue: true}, nil
+				}
+				pa.Status.ServerGroups[i].ServerStatus = "Bound"
+				allClear = false
 			}
-			r.eventf(pa, corev1.EventTypeWarning, "RemoveServerFailed",
-				"Failed to remove server from SG %s: %v", sgID, err)
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		removed = append(removed, sgID)
-	}
 
-	if len(removed) > 0 {
-		newList := make([]string, 0, len(pa.Status.RegisteredSGs)-len(removed))
-		removedSet := make(map[string]bool, len(removed))
-		for _, id := range removed {
-			removedSet[id] = true
-		}
-		for _, id := range pa.Status.RegisteredSGs {
-			if !removedSet[id] {
-				newList = append(newList, id)
+		default: // "Bound" or "Adding" — need to remove
+			port := r.lookupContainerPortForSG(pa, sg.Name)
+			req := &provider.RemoveServersRequest{
+				ServerGroupId: sg.ServerGroupId,
+				Servers: []provider.BackendServer{{
+					ServerType: "Ip",
+					ServerId:   pa.Spec.BoundPodIP,
+					ServerIp:   pa.Spec.BoundPodIP,
+					Port:       port,
+					Weight:     100,
+				}},
+				ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "remove", sg.ServerGroupId, pa.Spec.BoundPodIP, pa.ResourceVersion),
 			}
-		}
-		patch := client.MergeFrom(pa.DeepCopy())
-		pa.Status.RegisteredSGs = newList
-		if err := r.Status().Patch(ctx, pa, patch); err != nil {
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			if _, err := r.NLBClient.RemoveServersFromServerGroup(ctx, req); err != nil {
+				if isServerNotFoundError(err) {
+					if err := r.patchServerStatus(ctx, pa, i, ""); err != nil {
+						return ctrl.Result{Requeue: true}, nil
+					}
+					pa.Status.ServerGroups[i].ServerStatus = ""
+					continue
+				}
+				if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
+					// Request rejected, don't change status, retry next reconcile
+					allClear = false
+					continue
+				}
+				if isDuplicatedServerError(err) {
+					if err := r.patchServerStatus(ctx, pa, i, "Removing"); err != nil {
+						return ctrl.Result{Requeue: true}, nil
+					}
+					pa.Status.ServerGroups[i].ServerStatus = "Removing"
+					allClear = false
+					continue
+				}
+				r.eventf(pa, corev1.EventTypeWarning, "RemoveServerFailed",
+					"Failed to remove server from SG %s: %v", sg.ServerGroupId, err)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			// API accepted, mark Removing (will verify next reconcile)
+			if err := r.patchServerStatus(ctx, pa, i, "Removing"); err != nil {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			pa.Status.ServerGroups[i].ServerStatus = "Removing"
+			allClear = false
 		}
 	}
 
-	if removeThrottled {
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-	}
-
-	if len(pa.Status.RegisteredSGs) > 0 {
+	if !allClear {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
@@ -1249,17 +1313,79 @@ func (r *PortAllocationReconciler) handleDisabled(ctx context.Context, pa *nlbpo
 }
 
 func (r *PortAllocationReconciler) handleDisable(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation) (ctrl.Result, error) {
-	if err := r.removeServers(ctx, pa); err != nil {
-		if provider.IsLocalRateLimited(err) {
-			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+	// Reuse releasing logic to remove servers with per-SG tracking
+	allClear := true
+	for i, sg := range pa.Status.ServerGroups {
+		if sg.ServerGroupId == "" || sg.ServerStatus == "" || sg.ServerStatus == "None" {
+			continue
 		}
-		if isThrottlingError(err) {
-			return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+		switch sg.ServerStatus {
+		case "Removing":
+			found, err := r.isServerInSG(ctx, sg.ServerGroupId, pa.Spec.BoundPodIP)
+			if err != nil {
+				if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
+					allClear = false
+					continue
+				}
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			if !found {
+				if err := r.patchServerStatus(ctx, pa, i, ""); err != nil {
+					return ctrl.Result{Requeue: true}, nil
+				}
+				pa.Status.ServerGroups[i].ServerStatus = ""
+			} else {
+				allClear = false
+			}
+		default: // "Bound" or "Adding"
+			port := r.lookupContainerPortForSG(pa, sg.Name)
+			req := &provider.RemoveServersRequest{
+				ServerGroupId: sg.ServerGroupId,
+				Servers: []provider.BackendServer{{
+					ServerType: "Ip",
+					ServerId:   pa.Spec.BoundPodIP,
+					ServerIp:   pa.Spec.BoundPodIP,
+					Port:       port,
+					Weight:     100,
+				}},
+				ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "remove", sg.ServerGroupId, pa.Spec.BoundPodIP, pa.ResourceVersion),
+			}
+			if _, err := r.NLBClient.RemoveServersFromServerGroup(ctx, req); err != nil {
+				if isServerNotFoundError(err) {
+					if err := r.patchServerStatus(ctx, pa, i, ""); err != nil {
+						return ctrl.Result{Requeue: true}, nil
+					}
+					pa.Status.ServerGroups[i].ServerStatus = ""
+					continue
+				}
+				if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
+					// Request rejected, don't change status, retry next reconcile
+					allClear = false
+					continue
+				}
+				if isDuplicatedServerError(err) {
+					if err := r.patchServerStatus(ctx, pa, i, "Removing"); err != nil {
+						return ctrl.Result{Requeue: true}, nil
+					}
+					pa.Status.ServerGroups[i].ServerStatus = "Removing"
+					allClear = false
+					continue
+				}
+				r.eventf(pa, corev1.EventTypeWarning, "RemoveServerFailed",
+					"Failed to remove servers during disable: %v", err)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			if err := r.patchServerStatus(ctx, pa, i, "Removing"); err != nil {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			pa.Status.ServerGroups[i].ServerStatus = "Removing"
+			allClear = false
 		}
-		r.eventf(pa, corev1.EventTypeWarning, "RemoveServerFailed",
-			"Failed to remove servers during disable: %v", err)
+	}
+	if !allClear {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
+
 	pa.Status.Phase = nlbpoolv1alpha1.PortAllocationDisabled
 	pa.Status.ExternalAddresses = nil
 	pa.Status.Message = "Network disabled"
@@ -1306,7 +1432,6 @@ func (r *PortAllocationReconciler) resetToAvailable(ctx context.Context, pa *nlb
 
 	pa.Status.Phase = nlbpoolv1alpha1.PortAllocationAvailable
 	pa.Status.ExternalAddresses = nil
-	pa.Status.RegisteredSGs = nil
 	pa.Status.Message = message
 	if err := r.Status().Update(ctx, pa); err != nil {
 		if errors.IsConflict(err) {
@@ -1358,7 +1483,7 @@ func (r *PortAllocationReconciler) removeServers(ctx context.Context, pa *nlbpoo
 				Port:       port,
 				Weight:     100,
 			}},
-			ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "remove", sgRef.ServerGroupId, pa.Spec.BoundPodIP),
+			ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "remove", sgRef.ServerGroupId, pa.Spec.BoundPodIP, pa.ResourceVersion),
 		}
 		if _, err := r.NLBClient.RemoveServersFromServerGroup(ctx, req); err != nil {
 			if isServerNotFoundError(err) || isDuplicatedServerError(err) {
@@ -1390,8 +1515,8 @@ func (r *PortAllocationReconciler) updatePhaseLabel(ctx context.Context, pa *nlb
 
 // generateClientToken builds a deterministic, idempotent ClientToken bound
 // to (namespace, name, op, sgId, podIP).
-func (r *PortAllocationReconciler) generateClientToken(namespace, name, op, sgId, podIP string) string {
-	data := fmt.Sprintf("%s|%s|%s|%s|%s", namespace, name, op, sgId, podIP)
+func (r *PortAllocationReconciler) generateClientToken(parts ...string) string {
+	data := strings.Join(parts, "|")
 	return fmt.Sprintf("%x", md5.Sum([]byte(data)))
 }
 
@@ -1424,15 +1549,6 @@ func (r *PortAllocationReconciler) lookupContainerPortForSG(pa *nlbpoolv1alpha1.
 					return p.ListenerPort
 				}
 			}
-		}
-	}
-	return 0
-}
-
-func (r *PortAllocationReconciler) lookupContainerPortForSGById(pa *nlbpoolv1alpha1.PortAllocation, sgId string) int32 {
-	for _, sg := range pa.Spec.ServerGroups {
-		if sg.ServerGroupId == sgId {
-			return r.lookupContainerPortForSG(pa, sg.Name)
 		}
 	}
 	return 0

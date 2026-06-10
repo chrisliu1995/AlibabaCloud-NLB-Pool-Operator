@@ -51,6 +51,9 @@ type NLBAPIClient interface {
 	// idempotent recovery when CreateListener returns Conflict.Port).
 	ListListeners(ctx context.Context, req *ListListenersRequest) (*ListListenersResponse, error)
 
+	// ListServerGroupServers returns the backend servers registered in a ServerGroup.
+	ListServerGroupServers(ctx context.Context, serverGroupId string) ([]BackendServer, error)
+
 	// GetServerGroupAttribute fetches a server group's current attributes by ID.
 	// Returns (nil, nil) when the server group does not exist on the cloud.
 	GetServerGroupAttribute(ctx context.Context, serverGroupId string) (*ServerGroupAttribute, error)

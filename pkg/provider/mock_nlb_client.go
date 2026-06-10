@@ -126,6 +126,10 @@ func (m *MockNLBClient) GetJobStatus(ctx context.Context, jobId string) (string,
 	return JobStatusSucceeded, nil
 }
 
+func (m *MockNLBClient) ListServerGroupServers(ctx context.Context, serverGroupId string) ([]BackendServer, error) {
+	return nil, nil
+}
+
 func (m *MockNLBClient) ListServerGroups(ctx context.Context, req *ListServerGroupsRequest) (*ListServerGroupsResponse, error) {
 	if m.ListServerGroupsFunc != nil {
 		return m.ListServerGroupsFunc(ctx, req)

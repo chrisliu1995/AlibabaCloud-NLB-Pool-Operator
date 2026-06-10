@@ -84,6 +84,13 @@ func (r *RateLimitedClient) CreateListener(ctx context.Context, req *CreateListe
 	return r.client.CreateListener(ctx, req)
 }
 
+func (r *RateLimitedClient) ListServerGroupServers(ctx context.Context, serverGroupId string) ([]BackendServer, error) {
+	if err := checkLimit(r.ListSGLimiter); err != nil {
+		return nil, err
+	}
+	return r.client.ListServerGroupServers(ctx, serverGroupId)
+}
+
 func (r *RateLimitedClient) ListServerGroups(ctx context.Context, req *ListServerGroupsRequest) (*ListServerGroupsResponse, error) {
 	if err := checkLimit(r.ListSGLimiter); err != nil {
 		return nil, err
