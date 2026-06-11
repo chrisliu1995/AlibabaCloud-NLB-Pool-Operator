@@ -178,87 +178,102 @@ func (r *PortAllocationReconciler) handleDeletion(ctx context.Context, pa *nlbpo
 		return ctrl.Result{}, nil
 	}
 
+	// Set phase to Deleting so the status accurately reflects cleanup in progress.
+	if pa.Status.Phase != nlbpoolv1alpha1.PortAllocationDeleting {
+		pa.Status.Phase = nlbpoolv1alpha1.PortAllocationDeleting
+		pa.Status.Message = "Cleaning up cloud resources"
+		_ = r.Status().Update(ctx, pa)
+	}
+
 	// 1. Best-effort RemoveServers when still bound.
-	if pa.Status.Phase == nlbpoolv1alpha1.PortAllocationBound && pa.Spec.BoundPodIP != "" {
+	if pa.Spec.BoundPodIP != "" {
 		if err := r.removeServers(ctx, pa); err != nil {
 			r.eventf(pa, corev1.EventTypeWarning, "RemoveServerFailed",
 				"Failed to remove servers during deletion: %v", err)
 		}
+		r.clearPodClaim(ctx, pa)
+		pa.Spec.BoundPod = ""
+		pa.Spec.BoundPodIP = ""
+		_ = r.Update(ctx, pa)
 	}
 
-	// 2. Delete Listeners (must delete Listeners before SGs because Listeners reference SGs).
-	logger.Info("handleDeletion step 2: delete listeners", "count", len(pa.Status.Listeners))
-	var remainingListeners []nlbpoolv1alpha1.ListenerCloudStatus
-	for _, lsn := range pa.Status.Listeners {
+	// 2. Verify Listeners are gone (NLB cascade-deletion should have removed them).
+	// Instead of calling DeleteListener individually (which is wasteful since the
+	// NLBPool controller already deleted the NLB and triggers cascade), we just
+	// confirm each listener no longer exists via GetListenerAttribute.
+	logger.Info("handleDeletion step 2: verify listeners gone", "count", len(pa.Status.Listeners))
+	for len(pa.Status.Listeners) > 0 {
+		lsn := pa.Status.Listeners[0]
 		if lsn.ListenerId == "" {
+			pa.Status.Listeners = pa.Status.Listeners[1:]
 			continue
 		}
-		if err := r.NLBClient.DeleteListener(ctx, lsn.ListenerId); err != nil {
-			if !provider.IsNotFoundError(err) {
-				// Keep this listener for retry
-				remainingListeners = append(remainingListeners, lsn)
-				if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
-					// Persist progress and requeue
-					pa.Status.Listeners = remainingListeners
-					_ = r.Status().Update(ctx, pa)
-					if provider.IsLocalRateLimited(err) {
-						return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
-					}
-					return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
-				}
-				pa.Status.Listeners = remainingListeners
+		attr, err := r.NLBClient.GetListenerAttribute(ctx, lsn.ListenerId)
+		if err != nil {
+			if provider.IsNotFoundError(err) {
+				pa.Status.Listeners = pa.Status.Listeners[1:]
 				_ = r.Status().Update(ctx, pa)
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+				continue
 			}
+			_ = r.Status().Update(ctx, pa)
+			if provider.IsLocalRateLimited(err) {
+				return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+			}
+			if isThrottlingError(err) {
+				return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+			}
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
-		// Deleted successfully or NotFound - don't keep it
+		if attr == nil {
+			// Listener gone
+			pa.Status.Listeners = pa.Status.Listeners[1:]
+			_ = r.Status().Update(ctx, pa)
+			continue
+		}
+		// Listener still exists — cascade not yet complete, requeue
+		logger.Info("Listener still exists, waiting for cascade", "listenerId", lsn.ListenerId)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
-	// All listeners deleted, clear the list
-	pa.Status.Listeners = nil
+	// All listeners confirmed gone
 	pa.Status.ListenersReady = 0
 	pa.Status.ListenersTotal = 0
 
 	// 3. Delete ServerGroups.
+	// Same immediate-persistence pattern as Step 2.
 	logger.Info("handleDeletion step 3: delete SGs", "count", len(pa.Status.ServerGroups))
-	var remainingSGs []nlbpoolv1alpha1.ServerGroupCloudStatus
-	for _, sg := range pa.Status.ServerGroups {
+	for len(pa.Status.ServerGroups) > 0 {
+		sg := pa.Status.ServerGroups[0]
 		if sg.ServerGroupId == "" {
+			pa.Status.ServerGroups = pa.Status.ServerGroups[1:]
 			continue
 		}
 		if err := r.NLBClient.DeleteServerGroup(ctx, sg.ServerGroupId); err != nil {
 			logger.Info("DeleteServerGroup error", "sg", sg.ServerGroupId, "err", err.Error())
-			if !provider.IsNotFoundError(err) {
-				// ResourceInUse means Listeners still reference this SG. PA.Status.Listeners
-				// may have been cleared by an interrupted earlier deletion (e.g. Throttling),
-				// so step 2 found nothing while orphan listeners still live on the cloud.
-				// Discover and delete those orphan listeners by NLB+port, then requeue so
-				// the next pass can drop the SG.
-				if strings.Contains(err.Error(), "ResourceInUse") {
-					if cleanupErr := r.cleanupOrphanListeners(ctx, pa); cleanupErr != nil {
-						logger.Error(cleanupErr, "cleanupOrphanListeners failed", "sg", sg.ServerGroupId)
-						if provider.IsLocalRateLimited(cleanupErr) {
-							return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
-						}
-						if isThrottlingError(cleanupErr) {
-							return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
-						}
-					}
-					return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-				}
-				remainingSGs = append(remainingSGs, sg)
-				if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
-					pa.Status.ServerGroups = remainingSGs
-					_ = r.Status().Update(ctx, pa)
-					if provider.IsLocalRateLimited(err) {
-						return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
-					}
-					return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
-				}
-				pa.Status.ServerGroups = remainingSGs
+			if provider.IsNotFoundError(err) {
+				pa.Status.ServerGroups = pa.Status.ServerGroups[1:]
 				_ = r.Status().Update(ctx, pa)
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+				continue
 			}
+			// ResourceInUse means Listeners still reference this SG. With the
+			// new deletion order (NLBs deleted first, listeners cascade-deleted),
+			// this should only occur transiently while the cascade completes.
+			// Just requeue and retry.
+			if strings.Contains(err.Error(), "ResourceInUse") {
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			}
+			// Persist and requeue for other errors
+			_ = r.Status().Update(ctx, pa)
+			if provider.IsLocalRateLimited(err) {
+				return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+			}
+			if isThrottlingError(err) {
+				return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+			}
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
+		// Deleted successfully — remove from status immediately
+		pa.Status.ServerGroups = pa.Status.ServerGroups[1:]
+		_ = r.Status().Update(ctx, pa)
 	}
 	// All SGs deleted (or NotFound), cloud resources are cleaned up.
 	// Remove finalizer directly - PA is about to be garbage collected, status cleanup is best-effort.
@@ -1404,6 +1419,20 @@ func (r *PortAllocationReconciler) startReleasing(ctx context.Context, pa *nlbpo
 }
 
 func (r *PortAllocationReconciler) resetToAvailable(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation, message string) (ctrl.Result, error) {
+	// Remove any cloud SG backends that were added during binding before
+	// clearing BoundPodIP. Without this, a PA that had AddServers called
+	// but then got reset (e.g. Pod claim mismatch) would leave stale
+	// backend IPs in the SGs.
+	if pa.Spec.BoundPodIP != "" {
+		if err := r.removeServers(ctx, pa); err != nil {
+			r.eventf(pa, corev1.EventTypeWarning, "RemoveServerFailed",
+				"Failed to remove servers during resetToAvailable: %v", err)
+		}
+	}
+
+	// Clear the Pod's claim annotation so other PAs can claim it.
+	r.clearPodClaim(ctx, pa)
+
 	pa.Spec.BoundPod = ""
 	pa.Spec.BoundPodIP = ""
 	if err := r.Update(ctx, pa); err != nil {

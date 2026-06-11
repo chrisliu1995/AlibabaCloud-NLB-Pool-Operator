@@ -45,6 +45,11 @@ func main() {
 		getListenerQPS       float64
 		deleteListenerQPS    float64
 		deleteSGQPS          float64
+		listListenersByPortQPS float64
+		listServerGroupServersQPS float64
+		listListenersQPS     float64
+		getServerGroupAttributeQPS float64
+		getJobStatusQPS      float64
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
@@ -70,6 +75,16 @@ func main() {
 		"QPS limit for DeleteListener. 0 disables local limiting.")
 	flag.Float64Var(&deleteSGQPS, "delete-sg-qps", 3.0,
 		"QPS limit for DeleteServerGroup. 0 disables local limiting.")
+	flag.Float64Var(&listListenersByPortQPS, "list-listeners-by-port-qps", 5.0,
+		"QPS limit for ListListenersByPort. 0 disables local limiting.")
+	flag.Float64Var(&listServerGroupServersQPS, "list-server-group-servers-qps", 20.0,
+		"QPS limit for ListServerGroupServers. 0 disables local limiting.")
+	flag.Float64Var(&listListenersQPS, "list-listeners-qps", 20.0,
+		"QPS limit for ListListeners. 0 disables local limiting.")
+	flag.Float64Var(&getServerGroupAttributeQPS, "get-server-group-attribute-qps", 20.0,
+		"QPS limit for GetServerGroupAttribute. 0 disables local limiting.")
+	flag.Float64Var(&getJobStatusQPS, "get-job-status-qps", 20.0,
+		"QPS limit for GetJobStatus. 0 disables local limiting.")
 
 	opts := zap.Options{
 		Development: true,
@@ -119,12 +134,18 @@ func main() {
 	if getListenerQPS > 0 { rateLimitedClient.GetListenerLimiter = rate.NewLimiter(rate.Limit(getListenerQPS), 10) }
 	if deleteListenerQPS > 0 { rateLimitedClient.DeleteListenerLimiter = rate.NewLimiter(rate.Limit(deleteListenerQPS), 3) }
 	if deleteSGQPS > 0 { rateLimitedClient.DeleteSGLimiter = rate.NewLimiter(rate.Limit(deleteSGQPS), 3) }
+	if listListenersByPortQPS > 0 { rateLimitedClient.ListListenersByPortLimiter = rate.NewLimiter(rate.Limit(listListenersByPortQPS), 5) }
+	if listServerGroupServersQPS > 0 { rateLimitedClient.ListSGLimiter = rate.NewLimiter(rate.Limit(listServerGroupServersQPS), 10) }
+	if listListenersQPS > 0 { rateLimitedClient.ListListenersLimiter = rate.NewLimiter(rate.Limit(listListenersQPS), 10) }
+	if getServerGroupAttributeQPS > 0 { rateLimitedClient.GetSGAttrLimiter = rate.NewLimiter(rate.Limit(getServerGroupAttributeQPS), 10) }
+	if getJobStatusQPS > 0 { rateLimitedClient.GetJobLimiter = rate.NewLimiter(rate.Limit(getJobStatusQPS), 10) }
 
-	// NLBPool Controller - pure orchestrator, does not call cloud APIs.
+	// NLBPool Controller - orchestrator that uses cloud API for deletion verification.
 	if err = (&controller.NLBPoolReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("nlbpool-controller"),
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Recorder:  mgr.GetEventRecorderFor("nlbpool-controller"),
+		NLBClient: rateLimitedClient,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "NLBPool")
 		os.Exit(1)

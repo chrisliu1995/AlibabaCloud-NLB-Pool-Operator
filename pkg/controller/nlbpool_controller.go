@@ -20,10 +20,11 @@ import (
 	eipv1alpha1 "github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/apis/eipoperator/v1alpha1"
 	nlbv1 "github.com/chrisliu1995/AlibabaCloud-NLB-Operator/pkg/apis/nlboperator/v1"
 	nlbpoolv1alpha1 "github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/apis/v1alpha1"
+	"github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/pkg/provider"
 )
 
-// NLBPoolReconciler is a pure orchestrator: it manages child CRs (NLB, EIP,
-// ServerGroup, Listener, PortAllocation) and never calls any cloud APIs.
+// NLBPoolReconciler orchestrates child CRs (NLB, EIP, PortAllocation) and
+// uses the cloud NLB API during deletion to verify cascade completion.
 //
 // +kubebuilder:rbac:groups=nlbpool.alibabacloud.com,resources=nlbpools,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=nlbpool.alibabacloud.com,resources=nlbpools/status,verbs=get;update;patch
@@ -37,8 +38,9 @@ import (
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 type NLBPoolReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Scheme    *runtime.Scheme
+	Recorder  record.EventRecorder
+	NLBClient provider.NLBAPIClient
 }
 
 // Reconcile runs the orchestration loop.
@@ -59,6 +61,12 @@ func (r *NLBPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// pool finalizer is still present (deadlock). We therefore proactively
 	// delete every child CR and only remove the finalizer once they are all
 	// gone.
+	//
+	// Deletion order is critical:
+	//   Phase 1: Delete NLB/EIP CRs first → cloud NLB deletion cascade-deletes
+	//            all Listeners (1 API call replaces 1600 individual DeleteListener calls)
+	//   Phase 2: Wait for cloud NLBs to fully disappear (listeners cascade-complete)
+	//   Phase 3: Delete PAs → PA finalizer only needs to delete SGs (no ResourceInUse)
 	if !pool.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(pool, nlbpoolv1alpha1.FinalizerNLBPool) {
 			if pool.Status.Phase != nlbpoolv1alpha1.NLBPoolDeleting {
@@ -69,10 +77,23 @@ func (r *NLBPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				}
 			}
 
-			// Phase 1: Delete PortAllocations first. PA finalizers handle
-			// cloud-side SG/Listener cleanup, which needs NLB CRs to resolve
-			// orphan listeners. We must wait for all PAs to be fully gone
-			// before deleting NLB/EIP infrastructure.
+			// Phase 1: Delete NLB/EIP infrastructure CRs.
+			// Cloud NLB deletion cascade-deletes all Listeners, eliminating
+			// the need for PA finalizers to delete them individually.
+			if err := r.deleteInfrastructure(ctx, pool); err != nil {
+				logger.Error(err, "failed to delete infrastructure CRs")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+			}
+
+			// Phase 2: Wait for cloud NLBs to fully disappear. NLB deletion is
+			// async — we must ensure the cascade (listeners) is complete before
+			// PA finalizers try to delete SGs, otherwise ResourceInUse.
+			if r.hasCloudNLBs(ctx, pool) {
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+
+			// Phase 3: All cloud NLBs gone (listeners cascade-deleted).
+			// Now safe to delete PAs — their finalizers only need to delete SGs.
 			if err := r.deletePortAllocations(ctx, pool); err != nil {
 				logger.Error(err, "failed to delete PortAllocations")
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
@@ -81,12 +102,7 @@ func (r *NLBPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
 
-			// Phase 2: All PAs gone (cloud SGs/Listeners cleaned up).
-			// Now safe to delete NLB/EIP infrastructure CRs.
-			if err := r.deleteInfrastructure(ctx, pool); err != nil {
-				logger.Error(err, "failed to delete infrastructure CRs")
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
-			}
+			// Verify no remaining child CRs
 			if r.hasChildResources(ctx, pool) {
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
@@ -346,9 +362,39 @@ func (r *NLBPoolReconciler) hasPortAllocations(ctx context.Context, pool *nlbpoo
 	return false
 }
 
+// hasCloudNLBs verifies whether cloud NLB instances still exist by calling the
+// cloud API directly. This avoids race conditions where K8s NLB CRs are removed
+// before the cloud cascade (listener deletion) is complete.
+func (r *NLBPoolReconciler) hasCloudNLBs(ctx context.Context, pool *nlbpoolv1alpha1.NLBPool) bool {
+	logger := log.FromContext(ctx)
+
+	if len(pool.Status.CloudNLBIds) == 0 {
+		return false
+	}
+
+	for _, nlbId := range pool.Status.CloudNLBIds {
+		exists, err := r.NLBClient.LoadBalancerExists(ctx, nlbId)
+		if err != nil {
+			if provider.IsLocalRateLimited(err) {
+				return true
+			}
+			logger.Error(err, "LoadBalancerExists failed, assuming still exists", "nlbId", nlbId)
+			return true
+		}
+		if exists {
+			return true
+		}
+	}
+
+	pool.Status.CloudNLBIds = nil
+	_ = r.Status().Update(ctx, pool)
+	return false
+}
+
 // deleteInfrastructure deletes EIP, NLB, and legacy Listener/ServerGroup CRs
-// owned by the pool. Called only after all PAs are gone, ensuring that PA
-// finalizers have completed their cloud-side cleanup (which needs NLB CRs).
+// owned by the pool. Called BEFORE PAs are deleted so that cloud NLB deletion
+// cascade-deletes all listeners, eliminating the need for PA finalizers to
+// individually delete them.
 func (r *NLBPoolReconciler) deleteInfrastructure(ctx context.Context, pool *nlbpoolv1alpha1.NLBPool) error {
 	ns := pool.Namespace
 	poolLabels := client.MatchingLabels{nlbpoolv1alpha1.LabelPool: pool.Name}
@@ -403,10 +449,30 @@ func (r *NLBPoolReconciler) deleteInfrastructure(ctx context.Context, pool *nlbp
 	}
 
 	// Delete NLBs owned by this pool.
+	// First, collect cloud NLB IDs for later verification (before CR is gone).
 	nlbList := &nlbv1.NLBList{}
 	if err := r.List(ctx, nlbList, listOpts...); err != nil {
 		return fmt.Errorf("list NLBs: %w", err)
 	}
+	if len(pool.Status.CloudNLBIds) == 0 {
+		var cloudIds []string
+		for i := range nlbList.Items {
+			nlb := &nlbList.Items[i]
+			if !metav1.IsControlledBy(nlb, pool) {
+				continue
+			}
+			if id := nlb.Status.LoadBalancerId; id != "" {
+				cloudIds = append(cloudIds, id)
+			}
+		}
+		if len(cloudIds) > 0 {
+			pool.Status.CloudNLBIds = cloudIds
+			if err := r.Status().Update(ctx, pool); err != nil {
+				return fmt.Errorf("persist CloudNLBIds: %w", err)
+			}
+		}
+	}
+
 	for i := range nlbList.Items {
 		nlb := &nlbList.Items[i]
 		if !metav1.IsControlledBy(nlb, pool) {

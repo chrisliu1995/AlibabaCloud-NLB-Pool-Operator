@@ -12,6 +12,7 @@ const (
 	PortAllocationBound        PortAllocationPhase = "Bound"
 	PortAllocationReleasing    PortAllocationPhase = "Releasing"
 	PortAllocationDisabled     PortAllocationPhase = "Disabled"
+	PortAllocationDeleting     PortAllocationPhase = "Deleting"
 )
 
 // ServerGroupRef 引用SG（V6: 不再引用 CR name，直接持有云端 SG ID）

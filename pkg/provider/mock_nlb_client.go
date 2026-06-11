@@ -23,6 +23,7 @@ type MockNLBClient struct {
 	DeleteListenerFunc               func(ctx context.Context, listenerId string) error
 	ListServerGroupsByNameFunc       func(ctx context.Context, vpcId, serverGroupName string) (string, error)
 	ListListenersByPortFunc          func(ctx context.Context, loadBalancerId string, listenerPort int32) (string, error)
+	LoadBalancerExistsFunc           func(ctx context.Context, loadBalancerId string) (bool, error)
 
 	CreateServerGroupCalls            []CreateServerGroupRequest
 	CreateListenerCalls               []CreateListenerRequest
@@ -207,6 +208,13 @@ func (m *MockNLBClient) ListListenersByPort(ctx context.Context, loadBalancerId 
 		return m.ListListenersByPortFunc(ctx, loadBalancerId, listenerPort)
 	}
 	return "", nil
+}
+
+func (m *MockNLBClient) LoadBalancerExists(ctx context.Context, loadBalancerId string) (bool, error) {
+	if m.LoadBalancerExistsFunc != nil {
+		return m.LoadBalancerExistsFunc(ctx, loadBalancerId)
+	}
+	return false, nil
 }
 
 var _ NLBAPIClient = (*MockNLBClient)(nil)

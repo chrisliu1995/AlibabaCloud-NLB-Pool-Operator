@@ -103,6 +103,9 @@ type NLBPoolStatus struct {
 	BoundSlots int32 `json:"boundSlots,omitempty"`
 	// Message 附加信息
 	Message string `json:"message,omitempty"`
+	// CloudNLBIds stores cloud NLB instance IDs collected before deletion,
+	// used to verify cloud-side cascade deletion is complete before removing PAs.
+	CloudNLBIds []string `json:"cloudNLBIds,omitempty"`
 }
 
 // +kubebuilder:object:root=true

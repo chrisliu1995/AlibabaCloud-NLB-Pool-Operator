@@ -86,6 +86,10 @@ type NLBAPIClient interface {
 	// Returns the first non-empty PublicIPv4Address across all zone mappings;
 	// returns "" with no error when the address is not yet allocated.
 	GetLoadBalancerEIP(ctx context.Context, loadBalancerId string) (string, error)
+
+	// LoadBalancerExists checks whether a cloud NLB instance still exists.
+	// Returns true if the NLB is found (even in Deleting state), false if gone.
+	LoadBalancerExists(ctx context.Context, loadBalancerId string) (bool, error)
 }
 
 // ----------------------------------------------------------------------------

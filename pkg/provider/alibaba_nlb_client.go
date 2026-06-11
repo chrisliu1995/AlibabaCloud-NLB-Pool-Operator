@@ -5,6 +5,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	openapi "github.com/alibabacloud-go/darabonba-openapi/v2/client"
 	nlbsdk "github.com/alibabacloud-go/nlb-20220430/v4/client"
@@ -494,4 +495,26 @@ func (c *AlibabaNLBClient) GetLoadBalancerEIP(ctx context.Context, loadBalancerI
 		}
 	}
 	return "", nil
+}
+
+// LoadBalancerExists checks whether a cloud NLB instance still exists by
+// calling GetLoadBalancerAttribute. Returns false when the API returns
+// ResourceNotFound, true when the NLB is found (including Deleting state).
+func (c *AlibabaNLBClient) LoadBalancerExists(ctx context.Context, loadBalancerId string) (bool, error) {
+	if loadBalancerId == "" {
+		return false, nil
+	}
+	request := &nlbsdk.GetLoadBalancerAttributeRequest{
+		LoadBalancerId: tea.String(loadBalancerId),
+		RegionId:       tea.String(c.region),
+	}
+	_, err := c.client.GetLoadBalancerAttribute(request)
+	if err != nil {
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "ResourceNotFound") || strings.Contains(errMsg, "InvalidResourceId") {
+			return false, nil
+		}
+		return false, fmt.Errorf("GetLoadBalancerAttribute API error: %w", err)
+	}
+	return true, nil
 }

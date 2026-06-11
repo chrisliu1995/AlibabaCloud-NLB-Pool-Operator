@@ -38,6 +38,7 @@ type RateLimitedClient struct {
 	DeleteSGLimiter       *rate.Limiter
 	GetListenerLimiter    *rate.Limiter
 	DeleteListenerLimiter *rate.Limiter
+	ListListenersByPortLimiter *rate.Limiter
 }
 
 // NewRateLimitedClient builds a RateLimitedClient that, by default, does not
@@ -155,10 +156,17 @@ func (r *RateLimitedClient) ListServerGroupsByName(ctx context.Context, vpcId, s
 }
 
 func (r *RateLimitedClient) ListListenersByPort(ctx context.Context, loadBalancerId string, listenerPort int32) (string, error) {
-	if err := checkLimit(r.ListListenersLimiter); err != nil {
+	if err := checkLimit(r.ListListenersByPortLimiter); err != nil {
 		return "", err
 	}
 	return r.client.ListListenersByPort(ctx, loadBalancerId, listenerPort)
+}
+
+func (r *RateLimitedClient) LoadBalancerExists(ctx context.Context, loadBalancerId string) (bool, error) {
+	if err := checkLimit(r.GetEIPLimiter); err != nil {
+		return false, err
+	}
+	return r.client.LoadBalancerExists(ctx, loadBalancerId)
 }
 
 // Compile-time check that RateLimitedClient implements NLBAPIClient.
