@@ -68,13 +68,29 @@ func (r *NLBPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					return ctrl.Result{}, err
 				}
 			}
-			if err := r.deleteAllChildren(ctx, pool); err != nil {
-				logger.Error(err, "failed to delete child CRs")
+
+			// Phase 1: Delete PortAllocations first. PA finalizers handle
+			// cloud-side SG/Listener cleanup, which needs NLB CRs to resolve
+			// orphan listeners. We must wait for all PAs to be fully gone
+			// before deleting NLB/EIP infrastructure.
+			if err := r.deletePortAllocations(ctx, pool); err != nil {
+				logger.Error(err, "failed to delete PortAllocations")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+			}
+			if r.hasPortAllocations(ctx, pool) {
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+
+			// Phase 2: All PAs gone (cloud SGs/Listeners cleaned up).
+			// Now safe to delete NLB/EIP infrastructure CRs.
+			if err := r.deleteInfrastructure(ctx, pool); err != nil {
+				logger.Error(err, "failed to delete infrastructure CRs")
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 			}
 			if r.hasChildResources(ctx, pool) {
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
+
 			controllerutil.RemoveFinalizer(pool, nlbpoolv1alpha1.FinalizerNLBPool)
 			if err := r.Update(ctx, pool); err != nil {
 				return ctrl.Result{}, err
@@ -274,6 +290,119 @@ func (r *NLBPoolReconciler) deleteAllChildren(ctx context.Context, pool *nlbpool
 	}
 
 	// Step 5: Delete NLBs owned by this pool.
+	nlbList := &nlbv1.NLBList{}
+	if err := r.List(ctx, nlbList, listOpts...); err != nil {
+		return fmt.Errorf("list NLBs: %w", err)
+	}
+	for i := range nlbList.Items {
+		nlb := &nlbList.Items[i]
+		if !metav1.IsControlledBy(nlb, pool) {
+			continue
+		}
+		if !nlb.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if err := r.Delete(ctx, nlb); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("delete NLB %s: %w", nlb.Name, err)
+		}
+	}
+
+	return nil
+}
+
+// deletePortAllocations deletes only PortAllocation CRs owned by the pool.
+// PA finalizers will handle cloud-side SG/Listener cleanup before the CR is
+// garbage collected.
+func (r *NLBPoolReconciler) deletePortAllocations(ctx context.Context, pool *nlbpoolv1alpha1.NLBPool) error {
+	ns := pool.Namespace
+	poolLabels := client.MatchingLabels{nlbpoolv1alpha1.LabelPool: pool.Name}
+	listOpts := []client.ListOption{client.InNamespace(ns), poolLabels}
+
+	paList := &nlbpoolv1alpha1.PortAllocationList{}
+	if err := r.List(ctx, paList, listOpts...); err != nil {
+		return fmt.Errorf("list PortAllocations: %w", err)
+	}
+	for i := range paList.Items {
+		pa := &paList.Items[i]
+		if !pa.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if err := r.Delete(ctx, pa); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("delete PortAllocation %s: %w", pa.Name, err)
+		}
+	}
+	return nil
+}
+
+// hasPortAllocations reports whether any PortAllocation CR still exists for
+// the pool (including those pending finalizer completion).
+func (r *NLBPoolReconciler) hasPortAllocations(ctx context.Context, pool *nlbpoolv1alpha1.NLBPool) bool {
+	sel := client.MatchingLabels{nlbpoolv1alpha1.LabelPool: pool.Name}
+	ns := client.InNamespace(pool.Namespace)
+	paList := &nlbpoolv1alpha1.PortAllocationList{}
+	if err := r.List(ctx, paList, ns, sel); err == nil && len(paList.Items) > 0 {
+		return true
+	}
+	return false
+}
+
+// deleteInfrastructure deletes EIP, NLB, and legacy Listener/ServerGroup CRs
+// owned by the pool. Called only after all PAs are gone, ensuring that PA
+// finalizers have completed their cloud-side cleanup (which needs NLB CRs).
+func (r *NLBPoolReconciler) deleteInfrastructure(ctx context.Context, pool *nlbpoolv1alpha1.NLBPool) error {
+	ns := pool.Namespace
+	poolLabels := client.MatchingLabels{nlbpoolv1alpha1.LabelPool: pool.Name}
+	listOpts := []client.ListOption{client.InNamespace(ns), poolLabels}
+
+	// Delete legacy Listener CRs (V5 backward compatibility).
+	lsnList := &nlbv1.ListenerList{}
+	if err := r.List(ctx, lsnList, listOpts...); err != nil {
+		return fmt.Errorf("list Listeners: %w", err)
+	}
+	for i := range lsnList.Items {
+		lsn := &lsnList.Items[i]
+		if !lsn.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if err := r.Delete(ctx, lsn); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("delete Listener %s: %w", lsn.Name, err)
+		}
+	}
+
+	// Delete legacy ServerGroup CRs (V5 backward compatibility).
+	sgList := &nlbv1.ServerGroupList{}
+	if err := r.List(ctx, sgList, listOpts...); err != nil {
+		return fmt.Errorf("list ServerGroups: %w", err)
+	}
+	for i := range sgList.Items {
+		sg := &sgList.Items[i]
+		if !sg.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if err := r.Delete(ctx, sg); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("delete ServerGroup %s: %w", sg.Name, err)
+		}
+	}
+
+	// Delete EIPs owned by this pool.
+	eipList := &eipv1alpha1.EIPList{}
+	if err := r.List(ctx, eipList, listOpts...); err != nil {
+		return fmt.Errorf("list EIPs: %w", err)
+	}
+	for i := range eipList.Items {
+		eip := &eipList.Items[i]
+		if !metav1.IsControlledBy(eip, pool) {
+			continue
+		}
+		if !eip.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if err := r.Delete(ctx, eip); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("delete EIP %s: %w", eip.Name, err)
+		}
+	}
+
+	// Delete NLBs owned by this pool.
 	nlbList := &nlbv1.NLBList{}
 	if err := r.List(ctx, nlbList, listOpts...); err != nil {
 		return fmt.Errorf("list NLBs: %w", err)
