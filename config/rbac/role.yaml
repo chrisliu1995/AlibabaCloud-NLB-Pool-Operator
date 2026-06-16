@@ -14,10 +14,8 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - services
+  - pods
   verbs:
-  - create
-  - delete
   - get
   - list
   - patch
@@ -59,6 +57,26 @@ rules:
   - nlbpool.kruise.io
   resources:
   - nlbpools/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - nlbpool.kruise.io
+  resources:
+  - portallocations
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - nlbpool.kruise.io
+  resources:
+  - portallocations/status
   verbs:
   - get
   - patch

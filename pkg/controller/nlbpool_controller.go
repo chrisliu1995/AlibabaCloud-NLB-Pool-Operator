@@ -3,738 +3,873 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strconv"
-	"strings"
 	"time"
 
-	eipv1 "github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/apis/eipoperator/v1alpha1"
-	nlbv1 "github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/apis/nlboperator/v1"
-	nlbpov1alpha1 "github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/apis/v1alpha1"
-
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/utils/ptr"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	eipv1alpha1 "github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/apis/eipoperator/v1alpha1"
+	nlbv1 "github.com/chrisliu1995/AlibabaCloud-NLB-Operator/pkg/apis/nlboperator/v1"
+	nlbpoolv1alpha1 "github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/apis/v1alpha1"
+	"github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/pkg/provider"
 )
 
-const (
-	// IntranetEIPType marks intranet EIP type
-	IntranetEIPType = "intranet"
-
-	// DefaultEIPBandwidth is the default EIP bandwidth in Mbps
-	DefaultEIPBandwidth = "5"
-
-	// RequeueAfterPeriod is the period for periodic reconciliation
-	RequeueAfterPeriod = 30 * time.Second
-)
-
-// ZoneInfo holds parsed zone mapping info
-type ZoneInfo struct {
-	ZoneId    string
-	VSwitchId string
-}
-
-// NLBPoolReconciler reconciles a NLBPool object
+// NLBPoolReconciler orchestrates child CRs (NLB, EIP, PortAllocation) and
+// uses the cloud NLB API during deletion to verify cascade completion.
+//
+// +kubebuilder:rbac:groups=nlbpool.alibabacloud.com,resources=nlbpools,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=nlbpool.alibabacloud.com,resources=nlbpools/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=nlbpool.alibabacloud.com,resources=nlbpools/finalizers,verbs=update
+// +kubebuilder:rbac:groups=nlbpool.alibabacloud.com,resources=portallocations,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=nlbpool.alibabacloud.com,resources=portallocations/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=nlboperator.alibabacloud.com,resources=nlbs,verbs=get;list;watch;create;update;delete
+// +kubebuilder:rbac:groups=nlboperator.alibabacloud.com,resources=servergroups,verbs=get;list;watch;create;update;delete
+// +kubebuilder:rbac:groups=nlboperator.alibabacloud.com,resources=listeners,verbs=get;list;watch;create;update;delete
+// +kubebuilder:rbac:groups=eip.alibabacloud.com,resources=eips,verbs=get;list;watch;create;update;delete
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 type NLBPoolReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme    *runtime.Scheme
+	Recorder  record.EventRecorder
+	NLBClient provider.NLBAPIClient
 }
 
-// +kubebuilder:rbac:groups=nlbpool.kruise.io,resources=nlbpools,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=nlbpool.kruise.io,resources=nlbpools/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=nlboperator.alibabacloud.com,resources=nlbs,verbs=get;list;watch;create;update;delete
-// +kubebuilder:rbac:groups=eip.alibabacloud.com,resources=eips,verbs=get;list;watch;create;update;delete
-// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
-
-// Reconcile is the main reconciliation loop for NLBPool
+// Reconcile runs the orchestration loop.
 func (r *NLBPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// 1. Get NLBPool CR
-	pool := &nlbpov1alpha1.NLBPool{}
+	// 1. Fetch the NLBPool CR.
+	pool := &nlbpoolv1alpha1.NLBPool{}
 	if err := r.Get(ctx, req.NamespacedName, pool); err != nil {
 		if errors.IsNotFound(err) {
-			logger.Info("NLBPool resource not found, ignoring since object must be deleted")
 			return ctrl.Result{}, nil
 		}
-		logger.Error(err, "Failed to get NLBPool")
 		return ctrl.Result{}, err
 	}
 
-	// 2. Calculate pods per NLB
-	podsPerNLB := calculatePodsPerNLB(&pool.Spec)
-	if podsPerNLB <= 0 {
-		logger.Info("Invalid configuration: podsPerNLB <= 0, check port range and PortsPerPod",
-			"minPort", pool.Spec.MinPort, "maxPort", pool.Spec.MaxPort,
-			"blockPorts", pool.Spec.BlockPorts, "portsPerPod", pool.Spec.PortsPerPod)
-		// Update status to Failed
-		pool.Status.Phase = nlbpov1alpha1.NLBPoolPhaseFailed
-		_ = r.Status().Update(ctx, pool)
-		return ctrl.Result{RequeueAfter: RequeueAfterPeriod}, nil
-	}
+	// 2. Handle deletion. Because the pool itself owns child CRs with
+	// blockOwnerDeletion=true, K8s GC will not cascade-delete them while the
+	// pool finalizer is still present (deadlock). We therefore proactively
+	// delete every child CR and only remove the finalizer once they are all
+	// gone.
+	//
+	// Deletion order is critical:
+	//   Phase 1: Delete NLB/EIP CRs first → cloud NLB deletion cascade-deletes
+	//            all Listeners (1 API call replaces 1600 individual DeleteListener calls)
+	//   Phase 2: Wait for cloud NLBs to fully disappear (listeners cascade-complete)
+	//   Phase 3: Delete PAs → PA finalizer only needs to delete SGs (no ResourceInUse)
+	if !pool.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(pool, nlbpoolv1alpha1.FinalizerNLBPool) {
+			if pool.Status.Phase != nlbpoolv1alpha1.NLBPoolDeleting {
+				pool.Status.Phase = nlbpoolv1alpha1.NLBPoolDeleting
+				pool.Status.Message = "Deleting child resources"
+				if err := r.Status().Update(ctx, pool); err != nil {
+					return ctrl.Result{}, err
+				}
+			}
 
-	// 3. For each eipIspType, ensure NLB/EIP and Services
-	for _, eipIspType := range pool.Spec.EipIspTypes {
-		if err := r.ensurePrewarming(ctx, pool, eipIspType, podsPerNLB); err != nil {
-			logger.Error(err, "Failed to ensure prewarming", "eipIspType", eipIspType)
-			// Continue with other types, will retry on next reconciliation
+			// Phase 1: Delete NLB/EIP infrastructure CRs.
+			// Cloud NLB deletion cascade-deletes all Listeners, eliminating
+			// the need for PA finalizers to delete them individually.
+			if err := r.deleteInfrastructure(ctx, pool); err != nil {
+				logger.Error(err, "failed to delete infrastructure CRs")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+			}
+
+			// Phase 2: Wait for cloud NLBs to fully disappear. NLB deletion is
+			// async — we must ensure the cascade (listeners) is complete before
+			// PA finalizers try to delete SGs, otherwise ResourceInUse.
+			if r.hasCloudNLBs(ctx, pool) {
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+
+			// Phase 3: All cloud NLBs gone (listeners cascade-deleted).
+			// Now safe to delete PAs — their finalizers only need to delete SGs.
+			if err := r.deletePortAllocations(ctx, pool); err != nil {
+				logger.Error(err, "failed to delete PortAllocations")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+			}
+			if r.hasPortAllocations(ctx, pool) {
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+
+			// Verify no remaining child CRs
+			if r.hasChildResources(ctx, pool) {
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+
+			controllerutil.RemoveFinalizer(pool, nlbpoolv1alpha1.FinalizerNLBPool)
+			if err := r.Update(ctx, pool); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
+		return ctrl.Result{}, nil
 	}
 
-	// 4. Update Status
-	if err := r.updateStatus(ctx, pool); err != nil {
-		logger.Error(err, "Failed to update NLBPool status")
+	// 3. Ensure finalizer.
+	if !controllerutil.ContainsFinalizer(pool, nlbpoolv1alpha1.FinalizerNLBPool) {
+		controllerutil.AddFinalizer(pool, nlbpoolv1alpha1.FinalizerNLBPool)
+		if err := r.Update(ctx, pool); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// 4. Sync pool status to get fresh BoundSlots for expansion calculation.
+	r.syncPoolStatus(ctx, pool)
+	desiredNLBsPerLane := r.computeDesiredNLBs(pool)
+
+	// 5. Ensure baseline cloud-backed CRs (NLB + EIP) per lane.
+	nlbsReady, err := r.ensureNLBsAndEIPs(ctx, pool, desiredNLBsPerLane)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !nlbsReady {
+		_ = r.updatePhase(ctx, pool, nlbpoolv1alpha1.NLBPoolProvisioning, "waiting for NLB/EIP CRs to become ready")
+		r.syncPoolStatus(ctx, pool)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	// 6. Ensure one PortAllocation CR per slot. SG/Listener cloud resources
+	// are now provisioned by the PA Controller (V6 architecture).
+	allReady, err := r.ensureSlotResources(ctx, pool, desiredNLBsPerLane)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 5. Periodic requeue
-	return ctrl.Result{RequeueAfter: RequeueAfterPeriod}, nil
+	// 7. Decide phase + requeue cadence.
+	if allReady && nlbsReady {
+		_ = r.updatePhase(ctx, pool, nlbpoolv1alpha1.NLBPoolReady, "")
+	} else {
+		_ = r.updatePhase(ctx, pool, nlbpoolv1alpha1.NLBPoolProvisioning, "")
+	}
+
+	// 8. Refresh aggregated pool status counters (after phase update to avoid overwrite).
+	r.syncPoolStatus(ctx, pool)
+
+	if allReady && nlbsReady {
+		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+	}
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
+// SetupWithManager wires the controller into the manager.
 func (r *NLBPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&nlbpov1alpha1.NLBPool{}).
-		Owns(&corev1.Service{}).
+		For(&nlbpoolv1alpha1.NLBPool{}).
+		Owns(&nlbv1.NLB{}).
+		Owns(&nlbv1.ServerGroup{}).
+		Owns(&nlbv1.Listener{}).
+		Owns(&eipv1alpha1.EIP{}).
+		Watches(&nlbpoolv1alpha1.PortAllocation{},
+			handler.EnqueueRequestsFromMapFunc(r.paToNLBPool)).
 		Complete(r)
 }
 
-// ensurePrewarming ensures NLB/EIP resources exist and Services are pre-warmed
-func (r *NLBPoolReconciler) ensurePrewarming(ctx context.Context, pool *nlbpov1alpha1.NLBPool, eipIspType string, podsPerNLB int) error {
-	logger := log.FromContext(ctx)
-
-	// Calculate required NLBs based on current bound service count
-	boundServices := r.countBoundServices(ctx, pool)
-	requiredNLBs := calculateRequiredNLBs(&pool.Spec, podsPerNLB, boundServices)
-
-	logger.Info("Ensuring prewarming",
-		"eipIspType", eipIspType, "podsPerNLB", podsPerNLB,
-		"requiredNLBs", requiredNLBs, "boundServices", boundServices)
-
-	// List existing NLBs for this pool and eipIspType
-	nlbList := &nlbv1.NLBList{}
-	err := r.List(ctx, nlbList,
-		client.InNamespace(pool.Namespace),
-		client.MatchingLabels{
-			nlbpov1alpha1.LabelNLBPoolName:       pool.Name,
-			nlbpov1alpha1.LabelNLBPoolEipIspType: eipIspType,
-		})
-	if err != nil {
-		return fmt.Errorf("failed to list NLB CRs: %w", err)
-	}
-
-	existingCount := len(nlbList.Items)
-	logger.Info("Current NLB count", "existing", existingCount, "required", requiredNLBs)
-
-	// Create missing NLBs and EIPs
-	for i := existingCount; i < requiredNLBs; i++ {
-		logger.Info("Creating NLB instance", "index", i, "eipIspType", eipIspType)
-
-		// Create EIPs first (for each zone)
-		if err := r.ensureEIPsForNLB(ctx, pool, eipIspType, i); err != nil {
-			logger.Error(err, "Failed to ensure EIPs for NLB", "index", i)
-			continue
-		}
-
-		// Create NLB CR
-		if err := r.createNLBCR(ctx, pool, eipIspType, i); err != nil {
-			logger.Error(err, "Failed to create NLB CR", "index", i)
-			continue
-		}
-	}
-
-	// Re-list NLBs after creation (to include newly created ones)
-	nlbList = &nlbv1.NLBList{}
-	err = r.List(ctx, nlbList,
-		client.InNamespace(pool.Namespace),
-		client.MatchingLabels{
-			nlbpov1alpha1.LabelNLBPoolName:       pool.Name,
-			nlbpov1alpha1.LabelNLBPoolEipIspType: eipIspType,
-		})
-	if err != nil {
-		return fmt.Errorf("failed to re-list NLB CRs: %w", err)
-	}
-
-	// Prewarm Services for all NLBs
-	if err := r.prewarmServices(ctx, pool, eipIspType, nlbList.Items, podsPerNLB); err != nil {
-		logger.Error(err, "Failed to prewarm services")
-		// Don't return error, allow retry on next reconciliation
-	}
-
-	return nil
-}
-
-// ensureEIPsForNLB creates EIP CRs for all zones of a given NLB
-func (r *NLBPoolReconciler) ensureEIPsForNLB(ctx context.Context, pool *nlbpov1alpha1.NLBPool, eipIspType string, nlbIndex int) error {
-	logger := log.FromContext(ctx)
-
-	// Parse ZoneMaps
-	zones, _, err := parseZoneMaps(pool.Spec.ZoneMaps)
-	if err != nil {
-		return fmt.Errorf("failed to parse zoneMaps: %w", err)
-	}
-
-	// Create EIP for each zone
-	for zoneIdx := range zones {
-		if err := r.ensureEIPCR(ctx, pool, eipIspType, nlbIndex, zoneIdx); err != nil {
-			logger.Error(err, "Failed to ensure EIP CR",
-				"nlbIndex", nlbIndex, "zoneIndex", zoneIdx)
-			// Continue creating other EIPs
-		}
-	}
-
-	return nil
-}
-
-// ensureEIPCR creates an EIP CR if it doesn't exist
-func (r *NLBPoolReconciler) ensureEIPCR(ctx context.Context, pool *nlbpov1alpha1.NLBPool, eipIspType string, nlbIndex, zoneIndex int) error {
-	logger := log.FromContext(ctx)
-
-	eipName := fmt.Sprintf("%s-eip-%s-%d-z%d", pool.Name, strings.ToLower(eipIspType), nlbIndex, zoneIndex)
-
-	// Check if EIP CR already exists
-	existingEIP := &eipv1.EIP{}
-	err := r.Get(ctx, types.NamespacedName{Name: eipName, Namespace: pool.Namespace}, existingEIP)
-	if err == nil {
-		// EIP already exists
-		logger.Info("EIP CR already exists", "name", eipName,
-			"allocationID", existingEIP.Status.AllocationID)
+// paToNLBPool maps a PortAllocation event to the owning NLBPool reconcile
+// request. This ensures PA status changes (e.g. Available -> Bound) trigger
+// NLBPool reconcile so that expansion logic can react promptly.
+func (r *NLBPoolReconciler) paToNLBPool(ctx context.Context, obj client.Object) []reconcile.Request {
+	pa, ok := obj.(*nlbpoolv1alpha1.PortAllocation)
+	if !ok {
 		return nil
 	}
-	if !errors.IsNotFound(err) {
-		return fmt.Errorf("failed to get EIP CR %s: %w", eipName, err)
-	}
-
-	// Determine InternetChargeType based on ISP type
-	internetChargeType := "PayByTraffic"
-	if eipIspType == "ChinaTelecom" || eipIspType == "ChinaMobile" || eipIspType == "ChinaUnicom" {
-		internetChargeType = "PayByBandwidth"
-	}
-
-	// Create EIP CR
-	eipCR := &eipv1.EIP{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      eipName,
-			Namespace: pool.Namespace,
-			Labels: map[string]string{
-				nlbpov1alpha1.LabelEIPPoolName:       pool.Name,
-				nlbpov1alpha1.LabelEIPPoolIndex:      fmt.Sprintf("%d-z%d", nlbIndex, zoneIndex),
-				nlbpov1alpha1.LabelEIPPoolEipIspType: eipIspType,
-			},
-		},
-		Spec: eipv1.EIPSpec{
-			Name:                    eipName,
-			Bandwidth:               DefaultEIPBandwidth,
-			InternetChargeType:      internetChargeType,
-			ISP:                     eipIspType,
-			ReleaseStrategy:         "OnDelete",
-			Description:             fmt.Sprintf("EIP for NLBPool %s, NLB index %d, zone %d", pool.Name, nlbIndex, zoneIndex),
-			SecurityProtectionTypes: pool.Spec.SecurityProtectionTypes,
-		},
-	}
-
-	// Set OwnerReference to NLBPool for automatic cleanup
-	if err := ctrl.SetControllerReference(pool, eipCR, r.Scheme); err != nil {
-		return fmt.Errorf("failed to set controller reference for EIP: %w", err)
-	}
-
-	if err := r.Create(ctx, eipCR); err != nil {
-		if !errors.IsAlreadyExists(err) {
-			return fmt.Errorf("failed to create EIP CR %s: %w", eipName, err)
-		}
-		logger.Info("EIP CR already exists (concurrent creation)", "name", eipName)
-	} else {
-		logger.Info("Successfully created EIP CR", "name", eipName, "ispType", eipIspType)
-	}
-
-	return nil
-}
-
-// createNLBCR creates an NLB CR if it doesn't exist
-func (r *NLBPoolReconciler) createNLBCR(ctx context.Context, pool *nlbpov1alpha1.NLBPool, eipIspType string, index int) error {
-	logger := log.FromContext(ctx)
-
-	nlbName := fmt.Sprintf("%s-%s-%d", pool.Name, strings.ToLower(eipIspType), index)
-
-	// Check if NLB CR already exists
-	existingNLB := &nlbv1.NLB{}
-	err := r.Get(ctx, types.NamespacedName{Name: nlbName, Namespace: pool.Namespace}, existingNLB)
-	if err == nil {
-		logger.Info("NLB CR already exists", "name", nlbName,
-			"loadBalancerId", existingNLB.Status.LoadBalancerId)
+	poolName := pa.Labels[nlbpoolv1alpha1.LabelPool]
+	if poolName == "" {
 		return nil
 	}
-	if !errors.IsNotFound(err) {
-		return fmt.Errorf("failed to get NLB CR %s: %w", nlbName, err)
-	}
-
-	// Parse ZoneMaps
-	zones, vpcId, err := parseZoneMaps(pool.Spec.ZoneMaps)
-	if err != nil {
-		return fmt.Errorf("failed to parse zoneMaps: %w", err)
-	}
-
-	// Query EIP AllocationIDs for each zone
-	eipAllocationIDs := make([]string, 0, len(zones))
-	allEIPsReady := true
-
-	for zoneIdx := range zones {
-		eipName := fmt.Sprintf("%s-eip-%s-%d-z%d", pool.Name, strings.ToLower(eipIspType), index, zoneIdx)
-		eipCR := &eipv1.EIP{}
-		err := r.Get(ctx, types.NamespacedName{Name: eipName, Namespace: pool.Namespace}, eipCR)
-		if err == nil && eipCR.Status.AllocationID != "" {
-			eipAllocationIDs = append(eipAllocationIDs, eipCR.Status.AllocationID)
-			logger.Info("Found EIP with allocationID", "eipName", eipName, "allocationID", eipCR.Status.AllocationID)
-		} else {
-			allEIPsReady = false
-			if err != nil {
-				logger.Info("EIP not found yet, cannot create NLB", "eipName", eipName)
-			} else {
-				logger.Info("EIP exists but AllocationID not ready yet", "eipName", eipName)
-			}
-			break
-		}
-	}
-
-	if !allEIPsReady {
-		return fmt.Errorf("waiting for EIP AllocationIDs: all EIPs must be ready before NLB creation")
-	}
-
-	// Build ZoneMappings with EIP AllocationIDs
-	nlbZoneMappings := make([]nlbv1.ZoneMapping, 0, len(zones))
-	for i, zone := range zones {
-		zm := nlbv1.ZoneMapping{
-			ZoneId:    zone.ZoneId,
-			VSwitchId: zone.VSwitchId,
-		}
-		if i < len(eipAllocationIDs) {
-			zm.AllocationId = eipAllocationIDs[i]
-		}
-		nlbZoneMappings = append(nlbZoneMappings, zm)
-	}
-
-	// Determine address type
-	addressType := "Internet"
-	if strings.Contains(strings.ToLower(eipIspType), IntranetEIPType) {
-		addressType = "Intranet"
-	}
-
-	// Create NLB CR
-	nlbCR := &nlbv1.NLB{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      nlbName,
-			Namespace: pool.Namespace,
-			Labels: map[string]string{
-				nlbpov1alpha1.LabelNLBPoolName:       pool.Name,
-				nlbpov1alpha1.LabelNLBPoolIndex:      strconv.Itoa(index),
-				nlbpov1alpha1.LabelNLBPoolEipIspType: eipIspType,
-			},
+	return []reconcile.Request{{
+		NamespacedName: types.NamespacedName{
+			Name:      poolName,
+			Namespace: pa.Namespace,
 		},
-		Spec: nlbv1.NLBSpec{
-			LoadBalancerName: nlbName,
-			AddressType:      addressType,
-			AddressIpVersion: "ipv4",
-			VpcId:            vpcId,
-			ZoneMappings:     nlbZoneMappings,
-		},
-	}
-
-	// Set OwnerReference to NLBPool for automatic cleanup
-	if err := ctrl.SetControllerReference(pool, nlbCR, r.Scheme); err != nil {
-		return fmt.Errorf("failed to set controller reference for NLB: %w", err)
-	}
-
-	if err := r.Create(ctx, nlbCR); err != nil {
-		if !errors.IsAlreadyExists(err) {
-			return fmt.Errorf("failed to create NLB CR %s: %w", nlbName, err)
-		}
-		logger.Info("NLB CR already exists (concurrent creation)", "name", nlbName)
-	} else {
-		logger.Info("Successfully created NLB CR", "name", nlbName,
-			"vpcId", vpcId, "addressType", addressType, "zones", len(nlbZoneMappings))
-	}
-
-	return nil
+	}}
 }
 
-// prewarmServices creates pre-warmed Services for each NLB
-func (r *NLBPoolReconciler) prewarmServices(ctx context.Context, pool *nlbpov1alpha1.NLBPool, eipIspType string, nlbs []nlbv1.NLB, podsPerNLB int) error {
-	logger := log.FromContext(ctx)
+// -----------------------------------------------------------------------------
+// helpers
+// -----------------------------------------------------------------------------
 
-	createdCount := 0
-	skippedCount := 0
-	skippedNLBCount := 0
+// computeDesiredNLBs calculates how many NLB groups are needed per lane.
+// Expansion is triggered only when AvailableSlots drops below the configured
+// minimum free headroom (slotsPerNLB * minAvailableNLBs).
+func (r *NLBPoolReconciler) computeDesiredNLBs(pool *nlbpoolv1alpha1.NLBPool) int32 {
+	minFree := pool.Spec.SlotsPerNLB * pool.Spec.MinAvailableNLBs
+	currentNLBs := pool.Status.TotalSlots / pool.Spec.SlotsPerNLB
+	if currentNLBs < 1 {
+		currentNLBs = 1
+	}
+	if pool.Status.AvailableSlots >= minFree {
+		return currentNLBs
+	}
+	needed := pool.Status.BoundSlots + minFree
+	desiredNLBs := (needed + pool.Spec.SlotsPerNLB - 1) / pool.Spec.SlotsPerNLB
+	if desiredNLBs < currentNLBs {
+		desiredNLBs = currentNLBs
+	}
+	return desiredNLBs
+}
 
-	for _, nlb := range nlbs {
-		// Skip NLBs that are not ready yet
-		if nlb.Status.LoadBalancerId == "" {
-			logger.Info("NLB not ready yet, skipping service prewarming",
-				"nlbName", nlb.Name)
-			skippedNLBCount++
+// nlbNameForGroup returns the NLB CR name for a given lane and group index.
+// Group 0 uses the legacy format for backward compatibility.
+func (r *NLBPoolReconciler) nlbNameForGroup(pool *nlbpoolv1alpha1.NLBPool, lane nlbpoolv1alpha1.LaneConfig, groupIdx int32) string {
+	return fmt.Sprintf("%s-%s-%d", pool.Name, lane.Name, groupIdx)
+}
+
+// eipNameForGroup returns the EIP CR name for a given lane, group, and zone.
+func (r *NLBPoolReconciler) eipNameForGroup(pool *nlbpoolv1alpha1.NLBPool, lane nlbpoolv1alpha1.LaneConfig, groupIdx int32, zoneIdx int) string {
+	return fmt.Sprintf("%s-%s-%d-z%d", pool.Name, lane.Name, groupIdx, zoneIdx)
+}
+
+// deleteAllChildren proactively triggers deletion of every child CR owned by
+// the pool. The deletion order (PA -> Listener -> SG -> EIP -> NLB) reflects
+// the desired teardown sequence, but each child CR has its own finalizer that
+// guarantees the cloud-side ordering, so this function only needs to mark
+// the CRs for deletion. Subsequent reconciles wait until they are fully gone
+// before removing the pool finalizer.
+func (r *NLBPoolReconciler) deleteAllChildren(ctx context.Context, pool *nlbpoolv1alpha1.NLBPool) error {
+	ns := pool.Namespace
+	poolLabels := client.MatchingLabels{nlbpoolv1alpha1.LabelPool: pool.Name}
+	listOpts := []client.ListOption{client.InNamespace(ns), poolLabels}
+
+	// Step 1: Delete PortAllocations (release pod bindings first).
+	paList := &nlbpoolv1alpha1.PortAllocationList{}
+	if err := r.List(ctx, paList, listOpts...); err != nil {
+		return fmt.Errorf("list PortAllocations: %w", err)
+	}
+	for i := range paList.Items {
+		pa := &paList.Items[i]
+		if !pa.DeletionTimestamp.IsZero() {
 			continue
 		}
+		if err := r.Delete(ctx, pa); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("delete PortAllocation %s: %w", pa.Name, err)
+		}
+	}
 
-		nlbId := nlb.Status.LoadBalancerId
-
-		// Get NLB pool index from labels
-		nlbPoolIndexStr, ok := nlb.Labels[nlbpov1alpha1.LabelNLBPoolIndex]
-		if !ok {
-			logger.Error(fmt.Errorf("missing pool index label"), "NLB missing label",
-				"nlbName", nlb.Name, "label", nlbpov1alpha1.LabelNLBPoolIndex)
+	// Step 2: Delete Listeners (unbind from SGs/NLBs).
+	lsnList := &nlbv1.ListenerList{}
+	if err := r.List(ctx, lsnList, listOpts...); err != nil {
+		return fmt.Errorf("list Listeners: %w", err)
+	}
+	for i := range lsnList.Items {
+		lsn := &lsnList.Items[i]
+		if !lsn.DeletionTimestamp.IsZero() {
 			continue
 		}
-		nlbPoolIndex, err := strconv.Atoi(nlbPoolIndexStr)
-		if err != nil {
-			logger.Error(err, "Invalid pool index label", "nlbName", nlb.Name, "value", nlbPoolIndexStr)
+		if err := r.Delete(ctx, lsn); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("delete Listener %s: %w", lsn.Name, err)
+		}
+	}
+
+	// Step 3: Delete ServerGroups.
+	sgList := &nlbv1.ServerGroupList{}
+	if err := r.List(ctx, sgList, listOpts...); err != nil {
+		return fmt.Errorf("list ServerGroups: %w", err)
+	}
+	for i := range sgList.Items {
+		sg := &sgList.Items[i]
+		if !sg.DeletionTimestamp.IsZero() {
 			continue
 		}
-
-		// Create Service for each pod slot
-		for slotIdx := 0; slotIdx < podsPerNLB; slotIdx++ {
-			svcName := fmt.Sprintf("nlbpool-%s-%d-%d-%s",
-				pool.Name, nlbPoolIndex, slotIdx, strings.ToLower(eipIspType))
-
-			// Check if Service already exists
-			existingSvc := &corev1.Service{}
-			err := r.Get(ctx, types.NamespacedName{Name: svcName, Namespace: pool.Namespace}, existingSvc)
-			if err == nil {
-				skippedCount++
-				continue
-			}
-			if !errors.IsNotFound(err) {
-				logger.Error(err, "Failed to get Service", "svcName", svcName)
-				continue
-			}
-
-			// Calculate ports for this slot
-			ports := calculatePortsForSlot(pool.Spec, slotIdx)
-
-			// Build Service
-			svc := r.constructService(pool, svcName, nlbId, eipIspType, nlbPoolIndex, slotIdx, ports)
-
-			if err := r.Create(ctx, svc); err != nil {
-				if !errors.IsAlreadyExists(err) {
-					logger.Error(err, "Failed to create Service", "svcName", svcName)
-					continue
-				}
-				skippedCount++
-			} else {
-				createdCount++
-				logger.Info("Created pre-warmed Service", "svcName", svcName, "nlbId", nlbId)
-			}
+		if err := r.Delete(ctx, sg); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("delete ServerGroup %s: %w", sg.Name, err)
 		}
 	}
 
-	logger.Info("Prewarm services completed",
-		"eipIspType", eipIspType, "created", createdCount,
-		"skipped", skippedCount, "nlbNotReady", skippedNLBCount)
-
-	return nil
-}
-
-// constructService builds a Service object for prewarming
-func (r *NLBPoolReconciler) constructService(pool *nlbpov1alpha1.NLBPool, svcName, nlbId, eipIspType string, nlbIndex, slotIdx int, ports []corev1.ServicePort) *corev1.Service {
-	loadBalancerClass := "alibabacloud.com/nlb"
-
-	svcAnnotations := map[string]string{
-		nlbpov1alpha1.AnnotationSlbId:               nlbId,
-		nlbpov1alpha1.AnnotationSlbListenerOverride: "true",
+	// Step 4: Delete EIPs owned by this pool. Filter by ownerReference to
+	// avoid touching unrelated EIPs in the same namespace.
+	eipList := &eipv1alpha1.EIPList{}
+	if err := r.List(ctx, eipList, listOpts...); err != nil {
+		return fmt.Errorf("list EIPs: %w", err)
 	}
-
-	// Add health check annotations if configured
-	if pool.Spec.HealthCheck != nil && pool.Spec.HealthCheck.Flag == "on" {
-		addHealthCheckAnnotations(svcAnnotations, pool.Spec.HealthCheck)
-	}
-
-	svc := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        svcName,
-			Namespace:   pool.Namespace,
-			Annotations: svcAnnotations,
-			Labels: map[string]string{
-				nlbpov1alpha1.LabelNLBPoolName:        pool.Name,
-				nlbpov1alpha1.LabelSvcPoolStatus:      nlbpov1alpha1.SvcPoolStatusAvailable,
-				nlbpov1alpha1.LabelSvcPoolPortsPerPod: strconv.Itoa(pool.Spec.PortsPerPod),
-				nlbpov1alpha1.LabelSvcPoolProtocols:   protocolsToStrings(pool.Spec.Protocols),
-				nlbpov1alpha1.LabelNLBPoolEipIspType:  eipIspType,
-				nlbpov1alpha1.LabelNLBPoolIndex:       strconv.Itoa(nlbIndex),
-				nlbpov1alpha1.LabelServiceProxyName:   "dummy",
-			},
-		},
-		Spec: corev1.ServiceSpec{
-			Type:                          corev1.ServiceTypeLoadBalancer,
-			AllocateLoadBalancerNodePorts: ptr.To(false),
-			ExternalTrafficPolicy:         pool.Spec.ExternalTrafficPolicy,
-			LoadBalancerClass:             ptr.To(loadBalancerClass),
-			Selector: map[string]string{
-				nlbpov1alpha1.LabelNLBPoolPlaceholder: nlbpov1alpha1.PlaceholderValue,
-			},
-			Ports: ports,
-		},
-	}
-
-	// Set OwnerReference to NLBPool for automatic cleanup
-	_ = ctrl.SetControllerReference(pool, svc, r.Scheme)
-
-	return svc
-}
-
-// addHealthCheckAnnotations adds health check annotations to a Service
-func addHealthCheckAnnotations(annotations map[string]string, hc *nlbpov1alpha1.NLBHealthCheckConfig) {
-	annotations[nlbpov1alpha1.AnnotationHealthCheckFlag] = hc.Flag
-	if hc.Type != "" {
-		annotations[nlbpov1alpha1.AnnotationHealthCheckType] = hc.Type
-	}
-	if hc.ConnectPort != "" {
-		annotations[nlbpov1alpha1.AnnotationHealthCheckConnectPort] = hc.ConnectPort
-	}
-	if hc.ConnectTimeout != "" {
-		annotations[nlbpov1alpha1.AnnotationHealthCheckConnectTimeout] = hc.ConnectTimeout
-	}
-	if hc.Interval != "" {
-		annotations[nlbpov1alpha1.AnnotationHealthCheckInterval] = hc.Interval
-	}
-	if hc.HealthyThreshold != "" {
-		annotations[nlbpov1alpha1.AnnotationHealthyThreshold] = hc.HealthyThreshold
-	}
-	if hc.UnhealthyThreshold != "" {
-		annotations[nlbpov1alpha1.AnnotationUnhealthyThreshold] = hc.UnhealthyThreshold
-	}
-	if hc.Type == "http" {
-		if hc.Domain != "" {
-			annotations[nlbpov1alpha1.AnnotationHealthCheckDomain] = hc.Domain
+	for i := range eipList.Items {
+		eip := &eipList.Items[i]
+		if !metav1.IsControlledBy(eip, pool) {
+			continue
 		}
-		if hc.Uri != "" {
-			annotations[nlbpov1alpha1.AnnotationHealthCheckUri] = hc.Uri
+		if !eip.DeletionTimestamp.IsZero() {
+			continue
 		}
-		if hc.Method != "" {
-			annotations[nlbpov1alpha1.AnnotationHealthCheckMethod] = hc.Method
+		if err := r.Delete(ctx, eip); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("delete EIP %s: %w", eip.Name, err)
 		}
 	}
-}
 
-// updateStatus updates the NLBPool status
-func (r *NLBPoolReconciler) updateStatus(ctx context.Context, pool *nlbpov1alpha1.NLBPool) error {
-	logger := log.FromContext(ctx)
-
-	// Count NLBs
+	// Step 5: Delete NLBs owned by this pool.
 	nlbList := &nlbv1.NLBList{}
-	if err := r.List(ctx, nlbList,
-		client.InNamespace(pool.Namespace),
-		client.MatchingLabels{nlbpov1alpha1.LabelNLBPoolName: pool.Name},
-	); err != nil {
-		return fmt.Errorf("failed to list NLB CRs: %w", err)
+	if err := r.List(ctx, nlbList, listOpts...); err != nil {
+		return fmt.Errorf("list NLBs: %w", err)
 	}
-
-	readyNLBs := 0
-	for _, nlb := range nlbList.Items {
-		if nlb.Status.LoadBalancerId != "" && nlb.Status.LoadBalancerStatus == "Active" {
-			readyNLBs++
+	for i := range nlbList.Items {
+		nlb := &nlbList.Items[i]
+		if !metav1.IsControlledBy(nlb, pool) {
+			continue
+		}
+		if !nlb.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if err := r.Delete(ctx, nlb); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("delete NLB %s: %w", nlb.Name, err)
 		}
 	}
-
-	// Count Services
-	svcList := &corev1.ServiceList{}
-	if err := r.List(ctx, svcList,
-		client.InNamespace(pool.Namespace),
-		client.MatchingLabels{nlbpov1alpha1.LabelNLBPoolName: pool.Name},
-	); err != nil {
-		return fmt.Errorf("failed to list Services: %w", err)
-	}
-
-	available := 0
-	bound := 0
-	for _, svc := range svcList.Items {
-		status := svc.Labels[nlbpov1alpha1.LabelSvcPoolStatus]
-		switch status {
-		case nlbpov1alpha1.SvcPoolStatusAvailable:
-			available++
-		case nlbpov1alpha1.SvcPoolStatusBound:
-			bound++
-		}
-	}
-
-	// Update status
-	pool.Status.TotalNLBs = len(nlbList.Items)
-	pool.Status.ReadyNLBs = readyNLBs
-	pool.Status.TotalServices = len(svcList.Items)
-	pool.Status.AvailableServices = available
-	pool.Status.BoundServices = bound
-
-	// Determine Phase
-	if available > 0 {
-		pool.Status.Phase = nlbpov1alpha1.NLBPoolPhaseReady
-	} else if bound > 0 {
-		pool.Status.Phase = nlbpov1alpha1.NLBPoolPhasePending
-	} else {
-		pool.Status.Phase = nlbpov1alpha1.NLBPoolPhasePending
-	}
-
-	if err := r.Status().Update(ctx, pool); err != nil {
-		logger.Error(err, "Failed to update NLBPool status")
-		return err
-	}
-
-	logger.Info("Updated NLBPool status",
-		"totalNLBs", pool.Status.TotalNLBs, "readyNLBs", pool.Status.ReadyNLBs,
-		"totalServices", pool.Status.TotalServices,
-		"availableServices", pool.Status.AvailableServices,
-		"boundServices", pool.Status.BoundServices,
-		"phase", pool.Status.Phase)
 
 	return nil
 }
 
-// countBoundServices counts the number of bound services for a pool
-func (r *NLBPoolReconciler) countBoundServices(ctx context.Context, pool *nlbpov1alpha1.NLBPool) int {
-	svcList := &corev1.ServiceList{}
-	if err := r.List(ctx, svcList,
-		client.InNamespace(pool.Namespace),
-		client.MatchingLabels{
-			nlbpov1alpha1.LabelNLBPoolName:   pool.Name,
-			nlbpov1alpha1.LabelSvcPoolStatus: nlbpov1alpha1.SvcPoolStatusBound,
-		},
-	); err != nil {
-		return 0
+// deletePortAllocations deletes only PortAllocation CRs owned by the pool.
+// PA finalizers will handle cloud-side SG/Listener cleanup before the CR is
+// garbage collected.
+func (r *NLBPoolReconciler) deletePortAllocations(ctx context.Context, pool *nlbpoolv1alpha1.NLBPool) error {
+	ns := pool.Namespace
+	poolLabels := client.MatchingLabels{nlbpoolv1alpha1.LabelPool: pool.Name}
+	listOpts := []client.ListOption{client.InNamespace(ns), poolLabels}
+
+	paList := &nlbpoolv1alpha1.PortAllocationList{}
+	if err := r.List(ctx, paList, listOpts...); err != nil {
+		return fmt.Errorf("list PortAllocations: %w", err)
 	}
-	return len(svcList.Items)
-}
-
-// calculatePodsPerNLB calculates how many Pod slots one NLB can support
-func calculatePodsPerNLB(spec *nlbpov1alpha1.NLBPoolSpec) int {
-	lenRange := int(spec.MaxPort) - int(spec.MinPort) - len(spec.BlockPorts) + 1
-	if lenRange <= 0 || spec.PortsPerPod == 0 {
-		return 0
-	}
-	return lenRange / spec.PortsPerPod
-}
-
-// calculateRequiredNLBs calculates the number of NLBs needed
-func calculateRequiredNLBs(spec *nlbpov1alpha1.NLBPoolSpec, podsPerNLB, boundServices int) int {
-	if podsPerNLB <= 0 {
-		return 0
-	}
-	// Need enough NLBs so that (totalNLBs * podsPerNLB - boundServices) >= MinAvailable
-	needed := spec.MinAvailable + boundServices
-	required := (needed + podsPerNLB - 1) / podsPerNLB
-	if required < 1 {
-		return 1
-	}
-	return required
-}
-
-// calculatePortsForSlot calculates the ServicePort list for a given slot index
-func calculatePortsForSlot(spec nlbpov1alpha1.NLBPoolSpec, slotIdx int) []corev1.ServicePort {
-	ports := make([]corev1.ServicePort, spec.PortsPerPod)
-	basePort := spec.MinPort
-
-	for i := 0; i < spec.PortsPerPod; i++ {
-		portOffset := int32(slotIdx*spec.PortsPerPod + i)
-		port := basePort + portOffset
-
-		// Skip blocked ports
-		for isBlockedPort(port, spec.BlockPorts) {
-			portOffset++
-			port = basePort + portOffset
+	for i := range paList.Items {
+		pa := &paList.Items[i]
+		if !pa.DeletionTimestamp.IsZero() {
+			continue
 		}
-
-		ports[i] = corev1.ServicePort{
-			Name:       fmt.Sprintf("port-%d", i),
-			Port:       port,
-			TargetPort: intstr.FromInt(int(port)),
-			Protocol:   spec.Protocols[i%len(spec.Protocols)],
+		if err := r.Delete(ctx, pa); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("delete PortAllocation %s: %w", pa.Name, err)
 		}
 	}
-	return ports
+	return nil
 }
 
-// isBlockedPort checks if a port is in the blocked ports list
-func isBlockedPort(port int32, blockPorts []int32) bool {
-	for _, bp := range blockPorts {
-		if bp == port {
-			return true
-		}
+// hasPortAllocations reports whether any PortAllocation CR still exists for
+// the pool (including those pending finalizer completion).
+func (r *NLBPoolReconciler) hasPortAllocations(ctx context.Context, pool *nlbpoolv1alpha1.NLBPool) bool {
+	sel := client.MatchingLabels{nlbpoolv1alpha1.LabelPool: pool.Name}
+	ns := client.InNamespace(pool.Namespace)
+	paList := &nlbpoolv1alpha1.PortAllocationList{}
+	if err := r.List(ctx, paList, ns, sel); err == nil && len(paList.Items) > 0 {
+		return true
 	}
 	return false
 }
 
-// parseZoneMaps parses the ZoneMaps configuration
-// Format: "vpc-xxx@zone1:vswitch1,zone2:vswitch2"
-func parseZoneMaps(zoneMapsStr string) ([]ZoneInfo, string, error) {
-	if zoneMapsStr == "" {
-		return nil, "", fmt.Errorf("zoneMaps cannot be empty")
+// hasCloudNLBs verifies whether cloud NLB instances still exist by calling the
+// cloud API directly. This avoids race conditions where K8s NLB CRs are removed
+// before the cloud cascade (listener deletion) is complete.
+func (r *NLBPoolReconciler) hasCloudNLBs(ctx context.Context, pool *nlbpoolv1alpha1.NLBPool) bool {
+	logger := log.FromContext(ctx)
+
+	if len(pool.Status.CloudNLBIds) == 0 {
+		return false
 	}
 
-	if !strings.Contains(zoneMapsStr, "@") {
-		return nil, "", fmt.Errorf("zoneMaps must include VPC ID in format 'vpc-id@zone:vsw,...', got: %s", zoneMapsStr)
-	}
-
-	parts := strings.SplitN(zoneMapsStr, "@", 2)
-	if len(parts) != 2 {
-		return nil, "", fmt.Errorf("invalid zoneMaps format, expected 'vpc-id@zone:vsw,...', got: %s", zoneMapsStr)
-	}
-
-	vpcId := strings.TrimSpace(parts[0])
-	if vpcId == "" {
-		return nil, "", fmt.Errorf("VPC ID cannot be empty in zoneMaps")
-	}
-
-	zoneParts := strings.Split(parts[1], ",")
-	zones := make([]ZoneInfo, 0, len(zoneParts))
-
-	for _, zp := range zoneParts {
-		kv := strings.SplitN(strings.TrimSpace(zp), ":", 2)
-		if len(kv) != 2 {
-			return nil, "", fmt.Errorf("invalid zoneMap format: %s, expected 'zoneId:vSwitchId'", zp)
+	for _, nlbId := range pool.Status.CloudNLBIds {
+		exists, err := r.NLBClient.LoadBalancerExists(ctx, nlbId)
+		if err != nil {
+			if provider.IsLocalRateLimited(err) {
+				return true
+			}
+			logger.Error(err, "LoadBalancerExists failed, assuming still exists", "nlbId", nlbId)
+			return true
 		}
-
-		zoneId := strings.TrimSpace(kv[0])
-		vSwitchId := strings.TrimSpace(kv[1])
-
-		if zoneId == "" || vSwitchId == "" {
-			return nil, "", fmt.Errorf("zoneId and vSwitchId cannot be empty in: %s", zp)
+		if exists {
+			return true
 		}
-
-		zones = append(zones, ZoneInfo{
-			ZoneId:    zoneId,
-			VSwitchId: vSwitchId,
-		})
 	}
 
-	if len(zones) < 2 {
-		return nil, "", fmt.Errorf("at least 2 zone mappings are required, got %d", len(zones))
-	}
-
-	return zones, vpcId, nil
+	pool.Status.CloudNLBIds = nil
+	_ = r.Status().Update(ctx, pool)
+	return false
 }
 
-// protocolsToStrings converts a slice of Protocols to a dash-separated string
-func protocolsToStrings(protocols []corev1.Protocol) string {
-	strs := make([]string, len(protocols))
-	for i, p := range protocols {
-		strs[i] = string(p)
-	}
-	return strings.Join(strs, "-")
-}
+// deleteInfrastructure deletes EIP, NLB, and legacy Listener/ServerGroup CRs
+// owned by the pool. Called BEFORE PAs are deleted so that cloud NLB deletion
+// cascade-deletes all listeners, eliminating the need for PA finalizers to
+// individually delete them.
+func (r *NLBPoolReconciler) deleteInfrastructure(ctx context.Context, pool *nlbpoolv1alpha1.NLBPool) error {
+	ns := pool.Namespace
+	poolLabels := client.MatchingLabels{nlbpoolv1alpha1.LabelPool: pool.Name}
+	listOpts := []client.ListOption{client.InNamespace(ns), poolLabels}
 
-// listNLBsByPool lists NLB CRs for a given pool and eipIspType
-func listNLBsByPool(ctx context.Context, c client.Client, namespace, poolName, eipIspType string) (*nlbv1.NLBList, error) {
+	// Delete legacy Listener CRs (V5 backward compatibility).
+	lsnList := &nlbv1.ListenerList{}
+	if err := r.List(ctx, lsnList, listOpts...); err != nil {
+		return fmt.Errorf("list Listeners: %w", err)
+	}
+	for i := range lsnList.Items {
+		lsn := &lsnList.Items[i]
+		if !lsn.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if err := r.Delete(ctx, lsn); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("delete Listener %s: %w", lsn.Name, err)
+		}
+	}
+
+	// Delete legacy ServerGroup CRs (V5 backward compatibility).
+	sgList := &nlbv1.ServerGroupList{}
+	if err := r.List(ctx, sgList, listOpts...); err != nil {
+		return fmt.Errorf("list ServerGroups: %w", err)
+	}
+	for i := range sgList.Items {
+		sg := &sgList.Items[i]
+		if !sg.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if err := r.Delete(ctx, sg); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("delete ServerGroup %s: %w", sg.Name, err)
+		}
+	}
+
+	// Delete EIPs owned by this pool.
+	eipList := &eipv1alpha1.EIPList{}
+	if err := r.List(ctx, eipList, listOpts...); err != nil {
+		return fmt.Errorf("list EIPs: %w", err)
+	}
+	for i := range eipList.Items {
+		eip := &eipList.Items[i]
+		if !metav1.IsControlledBy(eip, pool) {
+			continue
+		}
+		if !eip.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if err := r.Delete(ctx, eip); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("delete EIP %s: %w", eip.Name, err)
+		}
+	}
+
+	// Delete NLBs owned by this pool.
+	// First, collect cloud NLB IDs for later verification (before CR is gone).
 	nlbList := &nlbv1.NLBList{}
-	labelSelector := labels.SelectorFromSet(map[string]string{
-		nlbpov1alpha1.LabelNLBPoolName:       poolName,
-		nlbpov1alpha1.LabelNLBPoolEipIspType: eipIspType,
-	})
-	err := c.List(ctx, nlbList,
-		client.InNamespace(namespace),
-		client.MatchingLabelsSelector{Selector: labelSelector},
-	)
-	return nlbList, err
+	if err := r.List(ctx, nlbList, listOpts...); err != nil {
+		return fmt.Errorf("list NLBs: %w", err)
+	}
+	if len(pool.Status.CloudNLBIds) == 0 {
+		var cloudIds []string
+		for i := range nlbList.Items {
+			nlb := &nlbList.Items[i]
+			if !metav1.IsControlledBy(nlb, pool) {
+				continue
+			}
+			if id := nlb.Status.LoadBalancerId; id != "" {
+				cloudIds = append(cloudIds, id)
+			}
+		}
+		if len(cloudIds) > 0 {
+			pool.Status.CloudNLBIds = cloudIds
+			if err := r.Status().Update(ctx, pool); err != nil {
+				return fmt.Errorf("persist CloudNLBIds: %w", err)
+			}
+		}
+	}
+
+	for i := range nlbList.Items {
+		nlb := &nlbList.Items[i]
+		if !metav1.IsControlledBy(nlb, pool) {
+			continue
+		}
+		if !nlb.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if err := r.Delete(ctx, nlb); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("delete NLB %s: %w", nlb.Name, err)
+		}
+	}
+
+	return nil
+}
+
+// hasChildResources reports whether any child CR still exists for the pool.
+func (r *NLBPoolReconciler) hasChildResources(ctx context.Context, pool *nlbpoolv1alpha1.NLBPool) bool {
+	sel := client.MatchingLabels{nlbpoolv1alpha1.LabelPool: pool.Name}
+	ns := client.InNamespace(pool.Namespace)
+
+	paList := &nlbpoolv1alpha1.PortAllocationList{}
+	if err := r.List(ctx, paList, ns, sel); err == nil && len(paList.Items) > 0 {
+		return true
+	}
+	nlbList := &nlbv1.NLBList{}
+	if err := r.List(ctx, nlbList, ns, sel); err == nil && len(nlbList.Items) > 0 {
+		return true
+	}
+	sgList := &nlbv1.ServerGroupList{}
+	if err := r.List(ctx, sgList, ns, sel); err == nil && len(sgList.Items) > 0 {
+		return true
+	}
+	lsnList := &nlbv1.ListenerList{}
+	if err := r.List(ctx, lsnList, ns, sel); err == nil && len(lsnList.Items) > 0 {
+		return true
+	}
+	eipList := &eipv1alpha1.EIPList{}
+	if err := r.List(ctx, eipList, ns, sel); err == nil && len(eipList.Items) > 0 {
+		return true
+	}
+	return false
+}
+
+// ensureNLBsAndEIPs creates EIP CRs per zone and NLB CRs per lane for each
+// group [0, desiredNLBsPerLane). Each zone in NLB ZoneMappings must reference
+// an independent EIP AllocationId (Aliyun rejects duplicates with
+// DuplicatedParam.AllocationId). All zone EIPs must have an AllocationID
+// before the NLB CR is created.
+func (r *NLBPoolReconciler) ensureNLBsAndEIPs(ctx context.Context, pool *nlbpoolv1alpha1.NLBPool, desiredNLBsPerLane int32) (bool, error) {
+	allReady := true
+	for nlbGroupIdx := int32(0); nlbGroupIdx < desiredNLBsPerLane; nlbGroupIdx++ {
+		for _, lane := range pool.Spec.Lanes {
+			nlbName := r.nlbNameForGroup(pool, lane, nlbGroupIdx)
+
+			// Step 1: Ensure one EIP CR per zone and collect AllocationIds.
+			eipAllocationIds := make([]string, len(pool.Spec.ZoneMaps))
+			eipsReady := true
+			for zIdx, zone := range pool.Spec.ZoneMaps {
+				eipName := r.eipNameForGroup(pool, lane, nlbGroupIdx, zIdx)
+				eipCR := &eipv1alpha1.EIP{}
+				err := r.Get(ctx, types.NamespacedName{Name: eipName, Namespace: pool.Namespace}, eipCR)
+				if errors.IsNotFound(err) {
+					eipCR = r.buildEIPCR(pool, lane, eipName)
+					if err := controllerutil.SetControllerReference(pool, eipCR, r.Scheme); err != nil {
+						return false, err
+					}
+					if err := r.Create(ctx, eipCR); err != nil && !errors.IsAlreadyExists(err) {
+						return false, err
+					}
+					r.Recorder.Eventf(pool, "Normal", "EIPCreated",
+						"Created EIP CR %s for lane %s zone %s", eipName, lane.Name, zone.Zone)
+					eipsReady = false
+					continue
+				} else if err != nil {
+					return false, err
+				}
+
+				// AllocationID is enough; InUse only flips after NLB binds the EIP.
+				if eipCR.Status.AllocationID == "" {
+					eipsReady = false
+					continue
+				}
+				eipAllocationIds[zIdx] = eipCR.Status.AllocationID
+			}
+
+			if !eipsReady {
+				allReady = false
+				continue
+			}
+
+			// Step 2: Ensure NLB CR exists with one AllocationId per zone.
+			nlbCR := &nlbv1.NLB{}
+			err := r.Get(ctx, types.NamespacedName{Name: nlbName, Namespace: pool.Namespace}, nlbCR)
+			if errors.IsNotFound(err) {
+				nlbCR = r.buildNLBCR(pool, lane, nlbName, eipAllocationIds)
+				if err := controllerutil.SetControllerReference(pool, nlbCR, r.Scheme); err != nil {
+					return false, err
+				}
+				if err := r.Create(ctx, nlbCR); err != nil && !errors.IsAlreadyExists(err) {
+					return false, err
+				}
+				r.Recorder.Eventf(pool, "Normal", "NLBCreated",
+					"Created NLB CR %s for lane %s with %d zone EIPs", nlbName, lane.Name, len(eipAllocationIds))
+				allReady = false
+				continue
+			} else if err != nil {
+				return false, err
+			}
+
+			// NLB exists: ensure each ZoneMapping carries its zone's AllocationId.
+			needUpdate := false
+			for i := range nlbCR.Spec.ZoneMappings {
+				if i >= len(eipAllocationIds) {
+					break
+				}
+				if eipAllocationIds[i] != "" && nlbCR.Spec.ZoneMappings[i].AllocationId != eipAllocationIds[i] {
+					nlbCR.Spec.ZoneMappings[i].AllocationId = eipAllocationIds[i]
+					needUpdate = true
+				}
+			}
+			if needUpdate {
+				if err := r.Update(ctx, nlbCR); err != nil {
+					return false, err
+				}
+				r.Recorder.Eventf(pool, "Normal", "NLBUpdated",
+					"Updated NLB CR %s ZoneMappings AllocationIds", nlbName)
+			}
+			// NLB Active implies all bound EIPs have flipped to InUse.
+			if nlbCR.Status.LoadBalancerStatus != "Active" {
+				allReady = false
+			}
+		}
+	}
+	return allReady, nil
+}
+
+// ensureSlotResources creates one PortAllocation CR per slot. The PA
+// Controller is responsible for provisioning the underlying SG/Listener
+// cloud resources (V6 architecture); NLBPool Controller no longer creates
+// SG/Listener CRs directly. Readiness is determined by checking that no PA
+// is still in Provisioning phase.
+func (r *NLBPoolReconciler) ensureSlotResources(ctx context.Context, pool *nlbpoolv1alpha1.NLBPool, desiredNLBsPerLane int32) (bool, error) {
+	totalSlots := desiredNLBsPerLane * pool.Spec.SlotsPerNLB
+
+	// Fast-path: if all slots exist, check readiness via PA phases.
+	startSlot := pool.Status.TotalSlots
+	if startSlot < 0 {
+		startSlot = 0
+	}
+	if startSlot >= totalSlots {
+		paList := &nlbpoolv1alpha1.PortAllocationList{}
+		if err := r.List(ctx, paList,
+			client.InNamespace(pool.Namespace),
+			client.MatchingLabels{nlbpoolv1alpha1.LabelPool: pool.Name}); err != nil {
+			return false, err
+		}
+		for _, pa := range paList.Items {
+			if pa.Status.Phase == nlbpoolv1alpha1.PortAllocationProvisioning || pa.Status.Phase == "" {
+				return false, nil
+			}
+		}
+		return true, nil
+	}
+
+	// Create new PA CRs only (no SG/Listener CR creation).
+	for slotIdx := startSlot; slotIdx < totalSlots; slotIdx++ {
+		paName := fmt.Sprintf("%s-s%d", pool.Name, slotIdx)
+		paCR := &nlbpoolv1alpha1.PortAllocation{}
+		err := r.Get(ctx, types.NamespacedName{Name: paName, Namespace: pool.Namespace}, paCR)
+		if errors.IsNotFound(err) {
+			paCR = r.buildPortAllocationCR(pool, slotIdx, paName)
+			if err := controllerutil.SetControllerReference(pool, paCR, r.Scheme); err != nil {
+				return false, err
+			}
+			if err := r.Create(ctx, paCR); err != nil {
+				return false, err
+			}
+			// Initialize status.Phase = Provisioning.
+			fresh := &nlbpoolv1alpha1.PortAllocation{}
+			if gerr := r.Get(ctx, types.NamespacedName{Name: paName, Namespace: pool.Namespace}, fresh); gerr == nil {
+				fresh.Status.Phase = nlbpoolv1alpha1.PortAllocationProvisioning
+				_ = r.Status().Update(ctx, fresh)
+			}
+			r.Recorder.Eventf(pool, "Normal", "PortAllocationCreated",
+				"Created PortAllocation CR %s for slot %d", paName, slotIdx)
+		} else if err != nil {
+			return false, err
+		}
+	}
+	// Still provisioning (new PAs just created).
+	return false, nil
+}
+
+// syncPoolStatus refreshes the pool's slot accounting in status.
+func (r *NLBPoolReconciler) syncPoolStatus(ctx context.Context, pool *nlbpoolv1alpha1.NLBPool) {
+	paList := &nlbpoolv1alpha1.PortAllocationList{}
+	if err := r.List(ctx, paList,
+		client.InNamespace(pool.Namespace),
+		client.MatchingLabels{nlbpoolv1alpha1.LabelPool: pool.Name}); err != nil {
+		return
+	}
+
+	var available, bound int32
+	for _, pa := range paList.Items {
+		switch pa.Status.Phase {
+		case nlbpoolv1alpha1.PortAllocationAvailable:
+			available++
+		case nlbpoolv1alpha1.PortAllocationBound:
+			bound++
+		}
+	}
+
+	fresh := &nlbpoolv1alpha1.NLBPool{}
+	if err := r.Get(ctx, types.NamespacedName{Name: pool.Name, Namespace: pool.Namespace}, fresh); err != nil {
+		return
+	}
+	fresh.Status.TotalSlots = int32(len(paList.Items))
+	fresh.Status.AvailableSlots = available
+	fresh.Status.BoundSlots = bound
+	// Compute NLBsPerLane from total slots.
+	if pool.Spec.SlotsPerNLB > 0 {
+		fresh.Status.NLBsPerLane = (fresh.Status.TotalSlots + pool.Spec.SlotsPerNLB - 1) / pool.Spec.SlotsPerNLB
+	}
+	if fresh.Status.NLBsPerLane < 1 {
+		fresh.Status.NLBsPerLane = 1
+	}
+	if fresh.Status.Phase == "" {
+		fresh.Status.Phase = nlbpoolv1alpha1.NLBPoolProvisioning
+	}
+	_ = r.Status().Update(ctx, fresh)
+
+	// Reflect status back to the in-memory copy so the caller sees the new
+	// counters without an extra round-trip.
+	pool.Status = fresh.Status
+}
+
+// updatePhase patches the pool's phase + message, fetching the latest object
+// first to avoid resourceVersion conflicts.
+func (r *NLBPoolReconciler) updatePhase(
+	ctx context.Context,
+	pool *nlbpoolv1alpha1.NLBPool,
+	phase nlbpoolv1alpha1.NLBPoolPhase,
+	message string,
+) error {
+	fresh := &nlbpoolv1alpha1.NLBPool{}
+	if err := r.Get(ctx, types.NamespacedName{Name: pool.Name, Namespace: pool.Namespace}, fresh); err != nil {
+		return err
+	}
+	if fresh.Status.Phase == phase && fresh.Status.Message == message {
+		return nil
+	}
+	fresh.Status.Phase = phase
+	fresh.Status.Message = message
+	return r.Status().Update(ctx, fresh)
+}
+
+// -----------------------------------------------------------------------------
+// builders
+// -----------------------------------------------------------------------------
+
+func (r *NLBPoolReconciler) buildNLBCR(
+	pool *nlbpoolv1alpha1.NLBPool,
+	lane nlbpoolv1alpha1.LaneConfig,
+	nlbName string,
+	eipAllocationIds []string,
+) *nlbv1.NLB {
+	zoneMappings := make([]nlbv1.ZoneMapping, 0, len(pool.Spec.ZoneMaps))
+	for i, z := range pool.Spec.ZoneMaps {
+		zm := nlbv1.ZoneMapping{
+			ZoneId:    z.Zone,
+			VSwitchId: z.VSwitchId,
+		}
+		// One independent EIP per zone (Aliyun rejects duplicate AllocationIds).
+		if i < len(eipAllocationIds) && eipAllocationIds[i] != "" {
+			zm.AllocationId = eipAllocationIds[i]
+		}
+		zoneMappings = append(zoneMappings, zm)
+	}
+	return &nlbv1.NLB{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      nlbName,
+			Namespace: pool.Namespace,
+			Labels: map[string]string{
+				nlbpoolv1alpha1.LabelPool: pool.Name,
+				nlbpoolv1alpha1.LabelLane: lane.Name,
+			},
+		},
+		Spec: nlbv1.NLBSpec{
+			LoadBalancerName: nlbName,
+			AddressType:      "Internet",
+			VpcId:            pool.Spec.VpcId,
+			ZoneMappings:     zoneMappings,
+		},
+	}
+}
+
+func (r *NLBPoolReconciler) buildEIPCR(
+	pool *nlbpoolv1alpha1.NLBPool,
+	lane nlbpoolv1alpha1.LaneConfig,
+	eipName string,
+) *eipv1alpha1.EIP {
+	// 单线 ISP 必须用 PayByBandwidth
+	chargeType := "PayByTraffic"
+	bandwidth := ""
+	if lane.ISPType == "ChinaTelecom" || lane.ISPType == "ChinaUnicom" || lane.ISPType == "ChinaMobile" {
+		chargeType = "PayByBandwidth"
+		bandwidth = "200"
+	}
+	return &eipv1alpha1.EIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      eipName,
+			Namespace: pool.Namespace,
+			Labels: map[string]string{
+				nlbpoolv1alpha1.LabelPool: pool.Name,
+				nlbpoolv1alpha1.LabelLane: lane.Name,
+			},
+		},
+		Spec: eipv1alpha1.EIPSpec{
+			Name:               eipName,
+			ISP:                lane.ISPType,
+			InternetChargeType: chargeType,
+			Bandwidth:          bandwidth,
+		},
+	}
+}
+
+func (r *NLBPoolReconciler) buildServerGroupCR(
+	pool *nlbpoolv1alpha1.NLBPool,
+	slotIdx int32,
+	port nlbpoolv1alpha1.PortConfig,
+	sgName string,
+) *nlbv1.ServerGroup {
+	return &nlbv1.ServerGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sgName,
+			Namespace: pool.Namespace,
+			Labels: map[string]string{
+				nlbpoolv1alpha1.LabelPool: pool.Name,
+				nlbpoolv1alpha1.LabelSlot: fmt.Sprintf("%d", slotIdx),
+				nlbpoolv1alpha1.LabelPort: port.Name,
+			},
+		},
+		Spec: nlbv1.ServerGroupSpec{
+			Region:          pool.Spec.Region,
+			VpcId:           pool.Spec.VpcId,
+			ServerGroupName: sgName,
+			ServerGroupType: "Ip",
+			Protocol:        port.Protocol,
+			Scheduler:       "Wrr",
+		},
+	}
+}
+
+func (r *NLBPoolReconciler) buildListenerCR(
+	pool *nlbpoolv1alpha1.NLBPool,
+	lane nlbpoolv1alpha1.LaneConfig,
+	port nlbpoolv1alpha1.PortConfig,
+	slotIdx int32,
+	lsnName, nlbName, sgName string,
+	listenerPort int32,
+) *nlbv1.Listener {
+	return &nlbv1.Listener{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      lsnName,
+			Namespace: pool.Namespace,
+			Labels: map[string]string{
+				nlbpoolv1alpha1.LabelPool: pool.Name,
+				nlbpoolv1alpha1.LabelSlot: fmt.Sprintf("%d", slotIdx),
+				nlbpoolv1alpha1.LabelPort: port.Name,
+				nlbpoolv1alpha1.LabelLane: lane.Name,
+			},
+		},
+		Spec: nlbv1.ListenerSpec{
+			Region:           pool.Spec.Region,
+			LoadBalancerRef:  nlbName,
+			ServerGroupRef:   sgName,
+			ListenerPort:     listenerPort,
+			ListenerProtocol: port.Protocol,
+		},
+	}
+}
+
+func (r *NLBPoolReconciler) buildPortAllocationCR(
+	pool *nlbpoolv1alpha1.NLBPool,
+	slotIdx int32,
+	paName string,
+) *nlbpoolv1alpha1.PortAllocation {
+	return &nlbpoolv1alpha1.PortAllocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      paName,
+			Namespace: pool.Namespace,
+			Labels: map[string]string{
+				nlbpoolv1alpha1.LabelPool:  pool.Name,
+				nlbpoolv1alpha1.LabelSlot:  fmt.Sprintf("%d", slotIdx),
+				nlbpoolv1alpha1.LabelPhase: string(nlbpoolv1alpha1.PortAllocationProvisioning),
+			},
+		},
+	}
 }

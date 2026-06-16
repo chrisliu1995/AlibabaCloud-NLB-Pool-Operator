@@ -21,10 +21,10 @@ spec:
     - jsonPath: .status.totalNLBs
       name: NLBs
       type: integer
-    - jsonPath: .status.availableServices
+    - jsonPath: .status.availableAllocations
       name: Available
       type: integer
-    - jsonPath: .status.boundServices
+    - jsonPath: .status.boundAllocations
       name: Bound
       type: integer
     name: v1alpha1
@@ -109,8 +109,9 @@ spec:
                 type: integer
               minAvailable:
                 description: |-
-                  MinAvailable is the minimum number of available (unbound) Services to maintain
-                  When available count drops below this value, Controller automatically creates new NLBs
+                  MinAvailable is the minimum number of available (unbound) PortAllocation
+                  slots to keep pre-warmed. Controller will create new NLBs when the
+                  available count drops below this value.
                 type: integer
               minPort:
                 description: MinPort is the minimum port for NLB Listener
@@ -147,31 +148,46 @@ spec:
           status:
             description: NLBPoolStatus defines the observed state of NLBPool
             properties:
-              availableServices:
-                description: AvailableServices is the number of available (unbound)
-                  Services
+              availableAllocations:
+                description: AvailableAllocations is the number of unbound PortAllocation
+                  slots
                 type: integer
-              boundServices:
-                description: BoundServices is the number of bound Services
+              boundAllocations:
+                description: BoundAllocations is the number of bound PortAllocation
+                  slots
                 type: integer
               phase:
                 description: Phase is the current phase of NLBPool
                 type: string
               readyNLBs:
-                description: ReadyNLBs is the number of ready NLB instances
+                description: ReadyNLBs is the number of NLB instances that have reached
+                  Active state
+                type: integer
+              totalAllocations:
+                description: TotalAllocations is the total number of pre-warmed PortAllocation
+                  slots
+                type: integer
+              totalListeners:
+                description: TotalListeners is the total number of pre-warmed Listeners
+                  across all NLBs
                 type: integer
               totalNLBs:
-                description: TotalNLBs is the total number of NLB instances
+                description: TotalNLBs is the total number of NLB instances managed
+                  by this pool
                 type: integer
-              totalServices:
-                description: TotalServices is the total number of pre-warmed Services
+              totalServerGroups:
+                description: |-
+                  TotalServerGroups is the total number of pre-warmed ServerGroups
+                  (one per (slot, logical port), shared across all NLBs)
                 type: integer
             required:
-            - availableServices
-            - boundServices
+            - availableAllocations
+            - boundAllocations
             - readyNLBs
+            - totalAllocations
+            - totalListeners
             - totalNLBs
-            - totalServices
+            - totalServerGroups
             type: object
         type: object
     served: true

@@ -1,0 +1,14 @@
+# Binaries
+manager
+bin/
+*.test
+*.exe
+*.out
+
+# Backup files
+*.bak
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store

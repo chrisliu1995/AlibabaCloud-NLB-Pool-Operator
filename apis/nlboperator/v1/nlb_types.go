@@ -25,6 +25,7 @@ type NLBSpec struct {
 type NLBStatus struct {
 	LoadBalancerId     string `json:"loadBalancerId,omitempty"`
 	LoadBalancerStatus string `json:"loadBalancerStatus,omitempty"`
+	DNSName            string `json:"dnsName,omitempty"`
 }
 
 // +kubebuilder:object:root=true
