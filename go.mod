@@ -20,7 +20,7 @@ require (
 	github.com/aliyun/credentials-go v1.4.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect
-	github.com/chrisliu1995/AlibabaCloud-NLB-Operator v0.0.0
+	github.com/chrisliu1995/AlibabaCloud-NLB-Operator v0.2.0
 	github.com/clbanning/mxj/v2 v2.7.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/emicklei/go-restful/v3 v3.11.0 // indirect
@@ -78,5 +78,3 @@ require (
 	sigs.k8s.io/structured-merge-diff/v4 v4.3.0 // indirect
 	sigs.k8s.io/yaml v1.3.0 // indirect
 )
-
-replace github.com/chrisliu1995/AlibabaCloud-NLB-Operator => /Users/liuqiuyang/go/src/github.com/chrisliu1995/AlibabaCloud-NLB-Operator
