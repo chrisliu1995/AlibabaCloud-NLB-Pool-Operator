@@ -35,7 +35,9 @@ rules:
 - apiGroups:
   - nlboperator.alibabacloud.com
   resources:
+  - listeners
   - nlbs
+  - servergroups
   verbs:
   - create
   - delete
@@ -44,7 +46,7 @@ rules:
   - update
   - watch
 - apiGroups:
-  - nlbpool.kruise.io
+  - nlbpool.alibabacloud.com
   resources:
   - nlbpools
   verbs:
@@ -54,15 +56,23 @@ rules:
   - update
   - watch
 - apiGroups:
-  - nlbpool.kruise.io
+  - nlbpool.alibabacloud.com
+  resources:
+  - nlbpools/finalizers
+  - portallocations/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - nlbpool.alibabacloud.com
   resources:
   - nlbpools/status
+  - portallocations/status
   verbs:
   - get
   - patch
   - update
 - apiGroups:
-  - nlbpool.kruise.io
+  - nlbpool.alibabacloud.com
   resources:
   - portallocations
   verbs:
@@ -73,11 +83,3 @@ rules:
   - patch
   - update
   - watch
-- apiGroups:
-  - nlbpool.kruise.io
-  resources:
-  - portallocations/status
-  verbs:
-  - get
-  - patch
-  - update

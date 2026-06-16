@@ -1,0 +1,217 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.5
+  name: nlbpools.nlbpool.alibabacloud.com
+spec:
+  group: nlbpool.alibabacloud.com
+  names:
+    kind: NLBPool
+    listKind: NLBPoolList
+    plural: nlbpools
+    singular: nlbpool
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.totalSlots
+      name: Total
+      type: integer
+    - jsonPath: .status.availableSlots
+      name: Available
+      type: integer
+    - jsonPath: .status.boundSlots
+      name: Bound
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: NLBPoolSpec defines the desired state of NLBPool
+            properties:
+              healthCheck:
+                description: HealthCheck NLB健康检查配置
+                properties:
+                  enabled:
+                    description: Enabled 是否启用
+                    type: boolean
+                required:
+                - enabled
+                type: object
+              lanes:
+                description: Lanes 每条线路配置（取代eipIspTypes数组）
+                items:
+                  description: LaneConfig 每条线路配置
+                  properties:
+                    ispType:
+                      description: 'ISPType 线路类型: BGP, BGP_PRO, ChinaTelecom, ChinaUnicom,
+                        ChinaMobile'
+                      type: string
+                    name:
+                      description: Name lane名称，用于CR命名
+                      type: string
+                  required:
+                  - ispType
+                  - name
+                  type: object
+                type: array
+              minAvailableNLBs:
+                description: MinAvailableNLBs 最小空闲NLB实例数（以NLB为粒度预热）
+                format: int32
+                type: integer
+              portRange:
+                description: PortRange Listener端口范围
+                properties:
+                  max:
+                    description: Max 最大端口
+                    format: int32
+                    type: integer
+                  min:
+                    description: Min 最小端口
+                    format: int32
+                    type: integer
+                required:
+                - max
+                - min
+                type: object
+              ports:
+                description: Ports 每Pod暴露的逻辑端口（取代portsPerPod + protocols）
+                items:
+                  description: PortConfig 每Pod暴露的逻辑端口
+                  properties:
+                    containerPort:
+                      description: ContainerPort 容器暴露的端口（后端服务器真实监听端口）
+                      format: int32
+                      type: integer
+                    name:
+                      description: Name 端口名称，用于CR命名
+                      type: string
+                    protocol:
+                      description: 'Protocol 协议: TCP, UDP, TCPSSL'
+                      type: string
+                  required:
+                  - name
+                  - protocol
+                  type: object
+                type: array
+              region:
+                description: Region 阿里云区域
+                type: string
+              slotsPerNLB:
+                description: SlotsPerNLB 每个NLB实例承载的slot数
+                format: int32
+                type: integer
+              vpcId:
+                description: VpcId VPC ID
+                type: string
+              zoneMaps:
+                description: ZoneMaps NLB需要的可用区和交换机
+                items:
+                  description: ZoneMapEntry 可用区映射
+                  properties:
+                    vswitchId:
+                      description: VSwitchId 交换机ID
+                      type: string
+                    zone:
+                      description: Zone 可用区ID
+                      type: string
+                  required:
+                  - vswitchId
+                  - zone
+                  type: object
+                type: array
+            required:
+            - lanes
+            - minAvailableNLBs
+            - portRange
+            - ports
+            - region
+            - slotsPerNLB
+            - vpcId
+            - zoneMaps
+            type: object
+          status:
+            description: NLBPoolStatus defines the observed state of NLBPool
+            properties:
+              availableSlots:
+                description: AvailableSlots 可用slot数
+                format: int32
+                type: integer
+              boundSlots:
+                description: BoundSlots 已绑定slot数
+                format: int32
+                type: integer
+              cloudNLBIds:
+                description: |-
+                  CloudNLBIds stores cloud NLB instance IDs collected before deletion,
+                  used to verify cloud-side cascade deletion is complete before removing PAs.
+                items:
+                  type: string
+                type: array
+              lanes:
+                description: Lanes 每条lane的状态
+                items:
+                  description: LaneStatus 每条lane的状态
+                  properties:
+                    eip:
+                      description: EIP 公网IP
+                      type: string
+                    name:
+                      description: Name lane名称
+                      type: string
+                    nlbId:
+                      description: NLBId 云端NLB ID
+                      type: string
+                    ready:
+                      description: Ready 是否就绪
+                      type: boolean
+                  required:
+                  - name
+                  - ready
+                  type: object
+                type: array
+              message:
+                description: Message 附加信息
+                type: string
+              nlbsPerLane:
+                description: NLBsPerLane 每条lane当前的NLB数
+                format: int32
+                type: integer
+              phase:
+                description: Phase 当前阶段
+                type: string
+              totalSlots:
+                description: TotalSlots 总slot数
+                format: int32
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
