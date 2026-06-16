@@ -25,7 +25,13 @@ import (
 
 // NLBPoolReconciler orchestrates child CRs (NLB, EIP, PortAllocation) and
 // uses the cloud NLB API during deletion to verify cascade completion.
-//
+type NLBPoolReconciler struct {
+	client.Client
+	Scheme    *runtime.Scheme
+	Recorder  record.EventRecorder
+	NLBClient provider.NLBAPIClient
+}
+
 // +kubebuilder:rbac:groups=nlbpool.alibabacloud.com,resources=nlbpools,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=nlbpool.alibabacloud.com,resources=nlbpools/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=nlbpool.alibabacloud.com,resources=nlbpools/finalizers,verbs=update
@@ -36,12 +42,6 @@ import (
 // +kubebuilder:rbac:groups=nlboperator.alibabacloud.com,resources=listeners,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups=eip.alibabacloud.com,resources=eips,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
-type NLBPoolReconciler struct {
-	client.Client
-	Scheme    *runtime.Scheme
-	Recorder  record.EventRecorder
-	NLBClient provider.NLBAPIClient
-}
 
 // Reconcile runs the orchestration loop.
 func (r *NLBPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

@@ -1,0 +1,249 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.5
+  name: portallocations.nlbpool.alibabacloud.com
+spec:
+  group: nlbpool.alibabacloud.com
+  names:
+    kind: PortAllocation
+    listKind: PortAllocationList
+    plural: portallocations
+    singular: portallocation
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .spec.boundPod
+      name: BoundPod
+      type: string
+    - jsonPath: .status.sgsReady
+      name: SGs
+      type: string
+    - jsonPath: .status.sgsTotal
+      name: SGsTotal
+      type: string
+    - jsonPath: .status.listenersReady
+      name: Listeners
+      type: string
+    - jsonPath: .status.listenersTotal
+      name: ListenersTotal
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: PortAllocationSpec defines the desired state of PortAllocation
+            properties:
+              boundPod:
+                description: BoundPod 当前绑定的Pod名称（PA Controller写入）
+                type: string
+              boundPodIP:
+                description: BoundPodIP Pod IP
+                type: string
+              endpoints:
+                description: Endpoints 每条lane的接入端点（NLBPool Controller填充）
+                items:
+                  description: LaneEndpoint 每条lane的接入端点
+                  properties:
+                    eip:
+                      description: EIP 公网IP
+                      type: string
+                    lane:
+                      description: Lane lane名称
+                      type: string
+                    ports:
+                      description: Ports 该lane上分配的监听端口
+                      items:
+                        description: EndpointPort lane上某端口的信息
+                        properties:
+                          containerPort:
+                            description: ContainerPort 容器端口（后端服务器真实监听端口）
+                            format: int32
+                            type: integer
+                          listenerId:
+                            description: 'ListenerId 云端 Listener ID（V6: 不再引用 CR name）'
+                            type: string
+                          listenerPort:
+                            description: ListenerPort 监听端口
+                            format: int32
+                            type: integer
+                          name:
+                            description: Name 端口名称
+                            type: string
+                          protocol:
+                            description: Protocol 协议
+                            type: string
+                        required:
+                        - containerPort
+                        - listenerPort
+                        - name
+                        - protocol
+                        type: object
+                      type: array
+                  required:
+                  - eip
+                  - lane
+                  - ports
+                  type: object
+                type: array
+              serverGroups:
+                description: ServerGroups 引用SG CR列表（NLBPool Controller填充）
+                items:
+                  description: 'ServerGroupRef 引用SG（V6: 不再引用 CR name，直接持有云端 SG ID）'
+                  properties:
+                    name:
+                      description: Name 端口名称（对应 pool.spec.ports[].name）
+                      type: string
+                    serverGroupId:
+                      description: ServerGroupId 云端 SG ID
+                      type: string
+                  required:
+                  - name
+                  - serverGroupId
+                  type: object
+                type: array
+            type: object
+          status:
+            description: PortAllocationStatus defines the observed state of PortAllocation
+            properties:
+              externalAddresses:
+                description: ExternalAddresses Bound时填充，供kruise-game读取
+                items:
+                  description: ExternalAddress 公网地址（供kruise-game读取）
+                  properties:
+                    ip:
+                      description: IP 公网IP
+                      type: string
+                    lane:
+                      description: Lane lane名称
+                      type: string
+                    ports:
+                      description: Ports 端口列表
+                      items:
+                        description: ExternalAddressPort 公网地址端口
+                        properties:
+                          name:
+                            description: Name 端口名称
+                            type: string
+                          port:
+                            description: Port 端口号
+                            format: int32
+                            type: integer
+                          protocol:
+                            description: Protocol 协议
+                            type: string
+                        required:
+                        - name
+                        - port
+                        - protocol
+                        type: object
+                      type: array
+                  required:
+                  - ip
+                  - lane
+                  - ports
+                  type: object
+                type: array
+              listeners:
+                description: Listeners 记录每个 (port, lane) 对应的云端 Listener 信息
+                items:
+                  description: ListenerCloudStatus 记录一个 Listener 的云端状态
+                  properties:
+                    laneName:
+                      description: LaneName 对应 pool.spec.lanes[].name
+                      type: string
+                    listenerId:
+                      description: ListenerId 云端 Listener ID
+                      type: string
+                    listenerPort:
+                      description: ListenerPort NLB 上的监听端口
+                      format: int32
+                      type: integer
+                    phase:
+                      description: 'Phase: Pending / Creating / Running'
+                      type: string
+                    portName:
+                      description: PortName 对应 pool.spec.ports[].name
+                      type: string
+                  required:
+                  - laneName
+                  - listenerPort
+                  - portName
+                  type: object
+                type: array
+              listenersReady:
+                description: ListenersReady 已就绪的 Listener 数量
+                format: int32
+                type: integer
+              listenersTotal:
+                description: ListenersTotal 总 Listener 数量
+                format: int32
+                type: integer
+              message:
+                description: Message 附加诊断信息
+                type: string
+              phase:
+                description: Phase 当前阶段
+                type: string
+              serverGroups:
+                description: 'ServerGroups 记录每个端口对应的云端 SG 信息（V6: PA 直管云资源）'
+                items:
+                  description: ServerGroupCloudStatus 记录一个 SG 的云端状态
+                  properties:
+                    name:
+                      description: Name 对应 pool.spec.ports[].name
+                      type: string
+                    phase:
+                      description: 'Phase: Pending / Creating / Active (SG 自身生命周期)'
+                      type: string
+                    serverGroupId:
+                      description: ServerGroupId 云端 SG ID
+                      type: string
+                    serverStatus:
+                      description: 'ServerStatus: "" / Adding / Bound / Removing (backend
+                        server 绑定状态)'
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
+              sgsReady:
+                description: SGsReady 已就绪的 SG 数量
+                format: int32
+                type: integer
+              sgsTotal:
+                description: SGsTotal 总 SG 数量
+                format: int32
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
