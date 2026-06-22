@@ -14,10 +14,10 @@ type ZoneMapping struct {
 
 // NLBSpec defines the desired state of NLB (simplified for pool operator)
 type NLBSpec struct {
-	LoadBalancerName string       `json:"loadBalancerName,omitempty"`
-	AddressType      string       `json:"addressType"`
-	AddressIpVersion string       `json:"addressIpVersion,omitempty"`
-	VpcId            string       `json:"vpcId"`
+	LoadBalancerName string        `json:"loadBalancerName,omitempty"`
+	AddressType      string        `json:"addressType"`
+	AddressIpVersion string        `json:"addressIpVersion,omitempty"`
+	VpcId            string        `json:"vpcId"`
 	ZoneMappings     []ZoneMapping `json:"zoneMappings"`
 }
 

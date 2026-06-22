@@ -26,18 +26,18 @@ type RateLimitedClient struct {
 	client NLBAPIClient
 
 	// Per-interface limiters. nil means no limit for that interface.
-	AddServersLimiter     *rate.Limiter
-	RemoveServersLimiter  *rate.Limiter
-	CreateSGLimiter       *rate.Limiter
-	CreateListenerLimiter *rate.Limiter
-	ListSGLimiter         *rate.Limiter
-	GetJobLimiter         *rate.Limiter
-	ListListenersLimiter  *rate.Limiter
-	GetEIPLimiter         *rate.Limiter
-	GetSGAttrLimiter      *rate.Limiter
-	DeleteSGLimiter       *rate.Limiter
-	GetListenerLimiter    *rate.Limiter
-	DeleteListenerLimiter *rate.Limiter
+	AddServersLimiter          *rate.Limiter
+	RemoveServersLimiter       *rate.Limiter
+	CreateSGLimiter            *rate.Limiter
+	CreateListenerLimiter      *rate.Limiter
+	ListSGLimiter              *rate.Limiter
+	GetJobLimiter              *rate.Limiter
+	ListListenersLimiter       *rate.Limiter
+	GetEIPLimiter              *rate.Limiter
+	GetSGAttrLimiter           *rate.Limiter
+	DeleteSGLimiter            *rate.Limiter
+	GetListenerLimiter         *rate.Limiter
+	DeleteListenerLimiter      *rate.Limiter
 	ListListenersByPortLimiter *rate.Limiter
 }
 

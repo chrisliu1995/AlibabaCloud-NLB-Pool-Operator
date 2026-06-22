@@ -12,8 +12,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	eipv1 "github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/apis/eipoperator/v1alpha1"
 	nlbv1 "github.com/chrisliu1995/AlibabaCloud-NLB-Operator/pkg/apis/nlboperator/v1"
+	eipv1 "github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/apis/eipoperator/v1alpha1"
 	nlbpov1alpha1 "github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/apis/v1alpha1"
 	"github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/pkg/controller"
 	"github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/pkg/provider"
@@ -33,23 +33,23 @@ func init() {
 
 func main() {
 	var (
-		metricsAddr          string
-		enableLeaderElection bool
-		probeAddr            string
-		addServersQPS        float64
-		removeServersQPS     float64
-		kubeAPIQPS           float64
-		kubeAPIBurst         int
-		createSGQPS          float64
-		createListenerQPS    float64
-		getListenerQPS       float64
-		deleteListenerQPS    float64
-		deleteSGQPS          float64
-		listListenersByPortQPS float64
-		listServerGroupServersQPS float64
-		listListenersQPS     float64
+		metricsAddr                string
+		enableLeaderElection       bool
+		probeAddr                  string
+		addServersQPS              float64
+		removeServersQPS           float64
+		kubeAPIQPS                 float64
+		kubeAPIBurst               int
+		createSGQPS                float64
+		createListenerQPS          float64
+		getListenerQPS             float64
+		deleteListenerQPS          float64
+		deleteSGQPS                float64
+		listListenersByPortQPS     float64
+		listServerGroupServersQPS  float64
+		listListenersQPS           float64
 		getServerGroupAttributeQPS float64
-		getJobStatusQPS      float64
+		getJobStatusQPS            float64
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
@@ -127,18 +127,42 @@ func main() {
 	// known to be throttled by Alibaba Cloud (AddServers / RemoveServers,
 	// 200/60s ~= 3.3 QPS) are limited; all other interfaces pass through.
 	rateLimitedClient := provider.NewRateLimitedClient(nlbClient)
-	if addServersQPS > 0 { rateLimitedClient.AddServersLimiter = rate.NewLimiter(rate.Limit(addServersQPS), 5) }
-	if removeServersQPS > 0 { rateLimitedClient.RemoveServersLimiter = rate.NewLimiter(rate.Limit(removeServersQPS), 5) }
-	if createSGQPS > 0 { rateLimitedClient.CreateSGLimiter = rate.NewLimiter(rate.Limit(createSGQPS), 3) }
-	if createListenerQPS > 0 { rateLimitedClient.CreateListenerLimiter = rate.NewLimiter(rate.Limit(createListenerQPS), 3) }
-	if getListenerQPS > 0 { rateLimitedClient.GetListenerLimiter = rate.NewLimiter(rate.Limit(getListenerQPS), 10) }
-	if deleteListenerQPS > 0 { rateLimitedClient.DeleteListenerLimiter = rate.NewLimiter(rate.Limit(deleteListenerQPS), 3) }
-	if deleteSGQPS > 0 { rateLimitedClient.DeleteSGLimiter = rate.NewLimiter(rate.Limit(deleteSGQPS), 3) }
-	if listListenersByPortQPS > 0 { rateLimitedClient.ListListenersByPortLimiter = rate.NewLimiter(rate.Limit(listListenersByPortQPS), 5) }
-	if listServerGroupServersQPS > 0 { rateLimitedClient.ListSGLimiter = rate.NewLimiter(rate.Limit(listServerGroupServersQPS), 10) }
-	if listListenersQPS > 0 { rateLimitedClient.ListListenersLimiter = rate.NewLimiter(rate.Limit(listListenersQPS), 10) }
-	if getServerGroupAttributeQPS > 0 { rateLimitedClient.GetSGAttrLimiter = rate.NewLimiter(rate.Limit(getServerGroupAttributeQPS), 10) }
-	if getJobStatusQPS > 0 { rateLimitedClient.GetJobLimiter = rate.NewLimiter(rate.Limit(getJobStatusQPS), 10) }
+	if addServersQPS > 0 {
+		rateLimitedClient.AddServersLimiter = rate.NewLimiter(rate.Limit(addServersQPS), 5)
+	}
+	if removeServersQPS > 0 {
+		rateLimitedClient.RemoveServersLimiter = rate.NewLimiter(rate.Limit(removeServersQPS), 5)
+	}
+	if createSGQPS > 0 {
+		rateLimitedClient.CreateSGLimiter = rate.NewLimiter(rate.Limit(createSGQPS), 3)
+	}
+	if createListenerQPS > 0 {
+		rateLimitedClient.CreateListenerLimiter = rate.NewLimiter(rate.Limit(createListenerQPS), 3)
+	}
+	if getListenerQPS > 0 {
+		rateLimitedClient.GetListenerLimiter = rate.NewLimiter(rate.Limit(getListenerQPS), 10)
+	}
+	if deleteListenerQPS > 0 {
+		rateLimitedClient.DeleteListenerLimiter = rate.NewLimiter(rate.Limit(deleteListenerQPS), 3)
+	}
+	if deleteSGQPS > 0 {
+		rateLimitedClient.DeleteSGLimiter = rate.NewLimiter(rate.Limit(deleteSGQPS), 3)
+	}
+	if listListenersByPortQPS > 0 {
+		rateLimitedClient.ListListenersByPortLimiter = rate.NewLimiter(rate.Limit(listListenersByPortQPS), 5)
+	}
+	if listServerGroupServersQPS > 0 {
+		rateLimitedClient.ListSGLimiter = rate.NewLimiter(rate.Limit(listServerGroupServersQPS), 10)
+	}
+	if listListenersQPS > 0 {
+		rateLimitedClient.ListListenersLimiter = rate.NewLimiter(rate.Limit(listListenersQPS), 10)
+	}
+	if getServerGroupAttributeQPS > 0 {
+		rateLimitedClient.GetSGAttrLimiter = rate.NewLimiter(rate.Limit(getServerGroupAttributeQPS), 10)
+	}
+	if getJobStatusQPS > 0 {
+		rateLimitedClient.GetJobLimiter = rate.NewLimiter(rate.Limit(getJobStatusQPS), 10)
+	}
 
 	// NLBPool Controller - orchestrator that uses cloud API for deletion verification.
 	if err = (&controller.NLBPoolReconciler{

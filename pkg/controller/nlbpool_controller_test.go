@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	eipv1 "github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/apis/eipoperator/v1alpha1"
 	nlbv1 "github.com/chrisliu1995/AlibabaCloud-NLB-Operator/pkg/apis/nlboperator/v1"
+	eipv1 "github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/apis/eipoperator/v1alpha1"
 	nlbpov1alpha1 "github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/apis/v1alpha1"
 	"github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/pkg/provider"
 
@@ -39,12 +39,12 @@ func newTestPool(name string) *nlbpov1alpha1.NLBPool {
 			Namespace: "default",
 		},
 		Spec: nlbpov1alpha1.NLBPoolSpec{
-			ZoneMaps:    "vpc-test@cn-hangzhou-h:vsw-aaa,cn-hangzhou-i:vsw-bbb",
-			MinPort:     10000,
-			MaxPort:     10009,
-			PortsPerPod: 2,
-			Protocols:   []corev1.Protocol{corev1.ProtocolTCP, corev1.ProtocolUDP},
-			EipIspTypes: []string{"BGP"},
+			ZoneMaps:     "vpc-test@cn-hangzhou-h:vsw-aaa,cn-hangzhou-i:vsw-bbb",
+			MinPort:      10000,
+			MaxPort:      10009,
+			PortsPerPod:  2,
+			Protocols:    []corev1.Protocol{corev1.ProtocolTCP, corev1.ProtocolUDP},
+			EipIspTypes:  []string{"BGP"},
 			MinAvailable: 3,
 		},
 	}
@@ -662,23 +662,23 @@ func TestCalculatePodsPerNLB(t *testing.T) {
 		expected int
 	}{
 		{
-			name: "basic calculation",
-			spec: &nlbpov1alpha1.NLBPoolSpec{MinPort: 10000, MaxPort: 10009, PortsPerPod: 2},
+			name:     "basic calculation",
+			spec:     &nlbpov1alpha1.NLBPoolSpec{MinPort: 10000, MaxPort: 10009, PortsPerPod: 2},
 			expected: 5,
 		},
 		{
-			name: "with blocked ports",
-			spec: &nlbpov1alpha1.NLBPoolSpec{MinPort: 10000, MaxPort: 10009, PortsPerPod: 2, BlockPorts: []int32{10003, 10004}},
+			name:     "with blocked ports",
+			spec:     &nlbpov1alpha1.NLBPoolSpec{MinPort: 10000, MaxPort: 10009, PortsPerPod: 2, BlockPorts: []int32{10003, 10004}},
 			expected: 4,
 		},
 		{
-			name: "zero portsPerPod",
-			spec: &nlbpov1alpha1.NLBPoolSpec{MinPort: 10000, MaxPort: 10009, PortsPerPod: 0},
+			name:     "zero portsPerPod",
+			spec:     &nlbpov1alpha1.NLBPoolSpec{MinPort: 10000, MaxPort: 10009, PortsPerPod: 0},
 			expected: 0,
 		},
 		{
-			name: "inverted range",
-			spec: &nlbpov1alpha1.NLBPoolSpec{MinPort: 10010, MaxPort: 10000, PortsPerPod: 2},
+			name:     "inverted range",
+			spec:     &nlbpov1alpha1.NLBPoolSpec{MinPort: 10010, MaxPort: 10000, PortsPerPod: 2},
 			expected: 0,
 		},
 	}
