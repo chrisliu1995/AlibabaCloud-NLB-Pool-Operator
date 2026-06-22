@@ -4,20 +4,20 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.16.5
-  name: eips.eip.alibabacloud.com
+  name: servergroups.nlboperator.alibabacloud.com
 spec:
-  group: eip.alibabacloud.com
+  group: nlboperator.alibabacloud.com
   names:
-    kind: EIP
-    listKind: EIPList
-    plural: eips
-    singular: eip
+    kind: ServerGroup
+    listKind: ServerGroupList
+    plural: servergroups
+    singular: servergroup
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - name: v1
     schema:
       openAPIV3Schema:
-        description: EIP is the Schema for the eips API
+        description: ServerGroup is the Schema for the servergroups API
         properties:
           apiVersion:
             description: |-
@@ -37,35 +37,39 @@ spec:
           metadata:
             type: object
           spec:
-            description: EIPSpec defines the desired state of EIP (simplified for
-              pool operator)
+            description: ServerGroupSpec defines the desired state of ServerGroup
             properties:
-              bandwidth:
+              protocol:
+                description: 'Protocol: TCP | UDP | TCPSSL'
                 type: string
-              description:
+              region:
                 type: string
-              internetChargeType:
+              scheduler:
                 type: string
-              isp:
+              serverGroupName:
                 type: string
-              name:
+              serverGroupType:
+                description: 'ServerGroupType: Ip | Instance'
                 type: string
-              releaseStrategy:
+              vpcId:
                 type: string
-              securityProtectionTypes:
-                items:
-                  type: string
-                type: array
+            required:
+            - protocol
+            - region
+            - serverGroupName
+            - serverGroupType
+            - vpcId
             type: object
           status:
-            description: EIPStatus defines the observed state of EIP (simplified for
-              pool operator)
+            description: ServerGroupStatus defines the observed state of ServerGroup
             properties:
-              allocationID:
+              message:
                 type: string
-              eipAddress:
+              phase:
+                description: ServerGroupPhase represents the lifecycle phase of a
+                  ServerGroup CR.
                 type: string
-              status:
+              serverGroupId:
                 type: string
             type: object
         type: object

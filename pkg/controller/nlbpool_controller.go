@@ -17,8 +17,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	eipv1alpha1 "github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/apis/eipoperator/v1alpha1"
 	nlbv1 "github.com/chrisliu1995/AlibabaCloud-NLB-Operator/pkg/apis/nlboperator/v1"
+	eipv1alpha1 "github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/apis/eipoperator/v1alpha1"
 	nlbpoolv1alpha1 "github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/apis/v1alpha1"
 	"github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/pkg/provider"
 )
@@ -124,11 +124,20 @@ func (r *NLBPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// 4. Sync pool status to get fresh BoundSlots for expansion calculation.
+	// 4. Validate lane config (fail-fast). Backstop for the CRD CEL rule
+	// in case CEL is disabled or the cluster K8s version doesn't enforce it.
+	if msg := validateLaneConfig(pool.Spec.Lanes); msg != "" {
+		r.Recorder.Eventf(pool, "Warning", "LaneConfigInvalid", "%s", msg)
+		_ = r.updatePhase(ctx, pool, nlbpoolv1alpha1.NLBPoolFailed, msg)
+		// Don't requeue — wait for user to fix the spec, which triggers a watch.
+		return ctrl.Result{}, nil
+	}
+
+	// 5. Sync pool status to get fresh BoundSlots for expansion calculation.
 	r.syncPoolStatus(ctx, pool)
 	desiredNLBsPerLane := r.computeDesiredNLBs(pool)
 
-	// 5. Ensure baseline cloud-backed CRs (NLB + EIP) per lane.
+	// 6. Ensure baseline cloud-backed CRs (NLB + EIP) per lane.
 	nlbsReady, err := r.ensureNLBsAndEIPs(ctx, pool, desiredNLBsPerLane)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -139,21 +148,21 @@ func (r *NLBPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	// 6. Ensure one PortAllocation CR per slot. SG/Listener cloud resources
+	// 7. Ensure one PortAllocation CR per slot. SG/Listener cloud resources
 	// are now provisioned by the PA Controller (V6 architecture).
 	allReady, err := r.ensureSlotResources(ctx, pool, desiredNLBsPerLane)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 7. Decide phase + requeue cadence.
+	// 8. Decide phase + requeue cadence.
 	if allReady && nlbsReady {
 		_ = r.updatePhase(ctx, pool, nlbpoolv1alpha1.NLBPoolReady, "")
 	} else {
 		_ = r.updatePhase(ctx, pool, nlbpoolv1alpha1.NLBPoolProvisioning, "")
 	}
 
-	// 8. Refresh aggregated pool status counters (after phase update to avoid overwrite).
+	// 9. Refresh aggregated pool status counters (after phase update to avoid overwrite).
 	r.syncPoolStatus(ctx, pool)
 
 	if allReady && nlbsReady {
@@ -528,43 +537,50 @@ func (r *NLBPoolReconciler) ensureNLBsAndEIPs(ctx context.Context, pool *nlbpool
 		for _, lane := range pool.Spec.Lanes {
 			nlbName := r.nlbNameForGroup(pool, lane, nlbGroupIdx)
 
-			// Step 1: Ensure one EIP CR per zone and collect AllocationIds.
-			eipAllocationIds := make([]string, len(pool.Spec.ZoneMaps))
-			eipsReady := true
-			for zIdx, zone := range pool.Spec.ZoneMaps {
-				eipName := r.eipNameForGroup(pool, lane, nlbGroupIdx, zIdx)
-				eipCR := &eipv1alpha1.EIP{}
-				err := r.Get(ctx, types.NamespacedName{Name: eipName, Namespace: pool.Namespace}, eipCR)
-				if errors.IsNotFound(err) {
-					eipCR = r.buildEIPCR(pool, lane, eipName)
-					if err := controllerutil.SetControllerReference(pool, eipCR, r.Scheme); err != nil {
+			// Step 1: For path A (independent EIP), ensure one EIP CR per zone.
+			// For path B (shared bandwidth package), skip — NLB will auto-create
+			// PayByTraffic EIPs and join them to the bandwidth package.
+			var eipAllocationIds []string
+			if lane.BandwidthPackageId == "" {
+				eipAllocationIds = make([]string, len(pool.Spec.ZoneMaps))
+				eipsReady := true
+				for zIdx, zone := range pool.Spec.ZoneMaps {
+					eipName := r.eipNameForGroup(pool, lane, nlbGroupIdx, zIdx)
+					eipCR := &eipv1alpha1.EIP{}
+					err := r.Get(ctx, types.NamespacedName{Name: eipName, Namespace: pool.Namespace}, eipCR)
+					if errors.IsNotFound(err) {
+						eipCR = r.buildEIPCR(pool, lane, eipName)
+						if err := controllerutil.SetControllerReference(pool, eipCR, r.Scheme); err != nil {
+							return false, err
+						}
+						if err := r.Create(ctx, eipCR); err != nil && !errors.IsAlreadyExists(err) {
+							return false, err
+						}
+						r.Recorder.Eventf(pool, "Normal", "EIPCreated",
+							"Created EIP CR %s for lane %s zone %s", eipName, lane.Name, zone.Zone)
+						eipsReady = false
+						continue
+					} else if err != nil {
 						return false, err
 					}
-					if err := r.Create(ctx, eipCR); err != nil && !errors.IsAlreadyExists(err) {
-						return false, err
+
+					// AllocationID is enough; InUse only flips after NLB binds the EIP.
+					if eipCR.Status.AllocationID == "" {
+						eipsReady = false
+						continue
 					}
-					r.Recorder.Eventf(pool, "Normal", "EIPCreated",
-						"Created EIP CR %s for lane %s zone %s", eipName, lane.Name, zone.Zone)
-					eipsReady = false
-					continue
-				} else if err != nil {
-					return false, err
+					eipAllocationIds[zIdx] = eipCR.Status.AllocationID
 				}
 
-				// AllocationID is enough; InUse only flips after NLB binds the EIP.
-				if eipCR.Status.AllocationID == "" {
-					eipsReady = false
+				if !eipsReady {
+					allReady = false
 					continue
 				}
-				eipAllocationIds[zIdx] = eipCR.Status.AllocationID
 			}
 
-			if !eipsReady {
-				allReady = false
-				continue
-			}
-
-			// Step 2: Ensure NLB CR exists with one AllocationId per zone.
+			// Step 2: Ensure NLB CR exists. eipAllocationIds is nil for path B;
+			// buildNLBCR will leave ZoneMappings[].AllocationId empty so the NLB
+			// API auto-creates EIPs joined to BandwidthPackageId.
 			nlbCR := &nlbv1.NLB{}
 			err := r.Get(ctx, types.NamespacedName{Name: nlbName, Namespace: pool.Namespace}, nlbCR)
 			if errors.IsNotFound(err) {
@@ -575,31 +591,39 @@ func (r *NLBPoolReconciler) ensureNLBsAndEIPs(ctx context.Context, pool *nlbpool
 				if err := r.Create(ctx, nlbCR); err != nil && !errors.IsAlreadyExists(err) {
 					return false, err
 				}
-				r.Recorder.Eventf(pool, "Normal", "NLBCreated",
-					"Created NLB CR %s for lane %s with %d zone EIPs", nlbName, lane.Name, len(eipAllocationIds))
+				if lane.BandwidthPackageId != "" {
+					r.Recorder.Eventf(pool, "Normal", "NLBCreated",
+						"Created NLB CR %s for lane %s with bandwidthPackageId %s", nlbName, lane.Name, lane.BandwidthPackageId)
+				} else {
+					r.Recorder.Eventf(pool, "Normal", "NLBCreated",
+						"Created NLB CR %s for lane %s with %d zone EIPs", nlbName, lane.Name, len(eipAllocationIds))
+				}
 				allReady = false
 				continue
 			} else if err != nil {
 				return false, err
 			}
 
-			// NLB exists: ensure each ZoneMapping carries its zone's AllocationId.
-			needUpdate := false
-			for i := range nlbCR.Spec.ZoneMappings {
-				if i >= len(eipAllocationIds) {
-					break
+			// Drift handling: only for path A (independent EIP). Path B's NLB
+			// has nil AllocationId by design — nothing to sync.
+			if lane.BandwidthPackageId == "" {
+				needUpdate := false
+				for i := range nlbCR.Spec.ZoneMappings {
+					if i >= len(eipAllocationIds) {
+						break
+					}
+					if eipAllocationIds[i] != "" && nlbCR.Spec.ZoneMappings[i].AllocationId != eipAllocationIds[i] {
+						nlbCR.Spec.ZoneMappings[i].AllocationId = eipAllocationIds[i]
+						needUpdate = true
+					}
 				}
-				if eipAllocationIds[i] != "" && nlbCR.Spec.ZoneMappings[i].AllocationId != eipAllocationIds[i] {
-					nlbCR.Spec.ZoneMappings[i].AllocationId = eipAllocationIds[i]
-					needUpdate = true
+				if needUpdate {
+					if err := r.Update(ctx, nlbCR); err != nil {
+						return false, err
+					}
+					r.Recorder.Eventf(pool, "Normal", "NLBUpdated",
+						"Updated NLB CR %s ZoneMappings AllocationIds", nlbName)
 				}
-			}
-			if needUpdate {
-				if err := r.Update(ctx, nlbCR); err != nil {
-					return false, err
-				}
-				r.Recorder.Eventf(pool, "Normal", "NLBUpdated",
-					"Updated NLB CR %s ZoneMappings AllocationIds", nlbName)
 			}
 			// NLB Active implies all bound EIPs have flipped to InUse.
 			if nlbCR.Status.LoadBalancerStatus != "Active" {
@@ -762,26 +786,56 @@ func (r *NLBPoolReconciler) buildNLBCR(
 			},
 		},
 		Spec: nlbv1.NLBSpec{
-			LoadBalancerName: nlbName,
-			AddressType:      "Internet",
-			VpcId:            pool.Spec.VpcId,
-			ZoneMappings:     zoneMappings,
+			LoadBalancerName:   nlbName,
+			AddressType:        "Internet",
+			VpcId:              pool.Spec.VpcId,
+			BandwidthPackageId: lane.BandwidthPackageId,
+			ZoneMappings:       zoneMappings,
 		},
 	}
 }
 
+// validateLaneConfig backstops the CRD CEL rule on LaneConfig. Returns
+// empty string when all lanes are valid; otherwise a human-readable
+// message describing the first violation.
+//
+// Single-ISP lanes (ChinaTelecom/Unicom/Mobile and their L2 variants)
+// require BandwidthPackageId because NLB rejects direct attachment of
+// single-ISP EIPs (OperationDenied.OnlyPayByTrafficSupported). The CRD
+// CEL rule on LaneConfig enforces the same invariant at API server level;
+// this function exists for clusters where CEL is disabled or for older
+// K8s versions.
+func validateLaneConfig(lanes []nlbpoolv1alpha1.LaneConfig) string {
+	singleISP := map[string]bool{
+		"ChinaTelecom":    true,
+		"ChinaUnicom":     true,
+		"ChinaMobile":     true,
+		"ChinaTelecom_L2": true,
+		"ChinaUnicom_L2":  true,
+		"ChinaMobile_L2":  true,
+	}
+	for _, lane := range lanes {
+		if singleISP[lane.ISPType] && lane.BandwidthPackageId == "" {
+			return fmt.Sprintf("lane %s uses single-ISP %s but no bandwidthPackageId; NLB rejects direct single-ISP EIPs. Set spec.lanes[].bandwidthPackageId to a CommonBandwidthPackage with matching ISP.",
+				lane.Name, lane.ISPType)
+		}
+	}
+	return ""
+}
+
+// buildEIPCR builds an independent EIP CR (path A). Only called when
+// lane.BandwidthPackageId is empty — path B (NLB auto-creates EIP and
+// joins it to the shared bandwidth package) skips EIP CR entirely.
+//
+// NLB requires PayByTraffic for independently-attached EIPs (cross-region
+// verified; see nlb-eip-charge-constraint memory), so we hard-code it here.
+// Single-ISP lanes are rejected upstream by CRD CEL validation, so we
+// don't need to handle PayByBandwidth at all.
 func (r *NLBPoolReconciler) buildEIPCR(
 	pool *nlbpoolv1alpha1.NLBPool,
 	lane nlbpoolv1alpha1.LaneConfig,
 	eipName string,
 ) *eipv1alpha1.EIP {
-	// 单线 ISP 必须用 PayByBandwidth
-	chargeType := "PayByTraffic"
-	bandwidth := ""
-	if lane.ISPType == "ChinaTelecom" || lane.ISPType == "ChinaUnicom" || lane.ISPType == "ChinaMobile" {
-		chargeType = "PayByBandwidth"
-		bandwidth = "200"
-	}
 	return &eipv1alpha1.EIP{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      eipName,
@@ -792,10 +846,11 @@ func (r *NLBPoolReconciler) buildEIPCR(
 			},
 		},
 		Spec: eipv1alpha1.EIPSpec{
-			Name:               eipName,
-			ISP:                lane.ISPType,
-			InternetChargeType: chargeType,
-			Bandwidth:          bandwidth,
+			Name:                    eipName,
+			ISP:                     lane.ISPType,
+			InternetChargeType:      "PayByTraffic",
+			Bandwidth:               lane.Bandwidth,
+			SecurityProtectionTypes: lane.SecurityProtectionTypes,
 		},
 	}
 }

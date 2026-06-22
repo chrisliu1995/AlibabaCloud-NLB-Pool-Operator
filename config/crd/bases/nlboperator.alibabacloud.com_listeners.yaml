@@ -4,20 +4,20 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.16.5
-  name: eips.eip.alibabacloud.com
+  name: listeners.nlboperator.alibabacloud.com
 spec:
-  group: eip.alibabacloud.com
+  group: nlboperator.alibabacloud.com
   names:
-    kind: EIP
-    listKind: EIPList
-    plural: eips
-    singular: eip
+    kind: Listener
+    listKind: ListenerList
+    plural: listeners
+    singular: listener
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - name: v1
     schema:
       openAPIV3Schema:
-        description: EIP is the Schema for the eips API
+        description: Listener is the Schema for the listeners API
         properties:
           apiVersion:
             description: |-
@@ -37,35 +37,42 @@ spec:
           metadata:
             type: object
           spec:
-            description: EIPSpec defines the desired state of EIP (simplified for
-              pool operator)
+            description: ListenerSpec defines the desired state of Listener
             properties:
-              bandwidth:
+              listenerPort:
+                description: ListenerPort is the listener front-end port.
+                format: int32
+                type: integer
+              listenerProtocol:
+                description: 'ListenerProtocol: TCP | UDP | TCPSSL'
                 type: string
-              description:
+              loadBalancerRef:
+                description: LoadBalancerRef references the NLB CR name in the same
+                  namespace.
                 type: string
-              internetChargeType:
+              region:
                 type: string
-              isp:
+              serverGroupRef:
+                description: ServerGroupRef references the ServerGroup CR name in
+                  the same namespace.
                 type: string
-              name:
-                type: string
-              releaseStrategy:
-                type: string
-              securityProtectionTypes:
-                items:
-                  type: string
-                type: array
+            required:
+            - listenerPort
+            - listenerProtocol
+            - loadBalancerRef
+            - region
+            - serverGroupRef
             type: object
           status:
-            description: EIPStatus defines the observed state of EIP (simplified for
-              pool operator)
+            description: ListenerStatus defines the observed state of Listener
             properties:
-              allocationID:
+              listenerId:
                 type: string
-              eipAddress:
+              message:
                 type: string
-              status:
+              phase:
+                description: ListenerPhase represents the lifecycle phase of a Listener
+                  CR.
                 type: string
             type: object
         type: object
