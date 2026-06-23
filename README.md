@@ -8,17 +8,11 @@ A Kubernetes operator that manages Alibaba Cloud NLB (Network Load Balancer) res
 NLBPool CR (user defines lanes, ports, slots)
    │
    ▼  NLB Pool Operator
-   ├─ Path A (independent EIP):
-   │    creates EIP CR per zone ──► EIP Operator ──► Alibaba Cloud EIP
-   │    BGP → PayByTraffic; Single-ISP → PayByBandwidth
+   │  Always creates EIP CR per zone ──► EIP Operator ──► Alibaba Cloud EIP
+   │    BGP/BGP_PRO → PayByTraffic; Single-ISP → PayByBandwidth
    │
-   ├─ Path B (BGP bandwidth package, no EIP CR):
-   │    passes bandwidthPackageId to NLB CR
-   │    NLB auto-creates BGP PayByTraffic EIPs joined to the package
-   │
-   ├─ Path A+B hybrid (single-ISP + bandwidth package):
-   │    creates EIP CR (PayByBandwidth) + passes both AllocationId
-   │    and bandwidthPackageId to NLB CR; NLB auto-joins EIP to package
+   │  When bandwidthPackageId is set, NLB receives both AllocationId and
+   │  BandwidthPackageId, and auto-joins the EIP to the bandwidth package
    │
    ├─ creates NLB CR per (lane, group) ──► NLB Operator ──► Alibaba Cloud NLB
    │
@@ -34,7 +28,7 @@ NLBPool CR (user defines lanes, ports, slots)
 
 - **NLB Pool Operator**: Owns NLBPool CR; orchestrates NLB, EIP, and PortAllocation lifecycle.
 - **NLB Operator** ([repo](https://github.com/chrisliu1995/AlibabaCloud-NLB-Operator)): Reconciles NLB CRs into real NLB instances.
-- **EIP Operator** ([repo](https://github.com/chrisliu1995/AlibabaCloud-EIP-Operator)): Reconciles EIP CRs into Elastic IPs (path A / A+B only).
+- **EIP Operator** ([repo](https://github.com/chrisliu1995/AlibabaCloud-EIP-Operator)): Reconciles EIP CRs into Elastic IPs.
 - **kruise-game V3 Plugin** ([merged PR #335](https://github.com/openkruise/kruise-game/pull/335)): Binds Pods to available PortAllocations by writing Pod IP into ServerGroups.
 
 ## Prerequisites
@@ -130,7 +124,7 @@ lanes:
     bandwidthPackageId: cbwp-uf6xxxxxxxxxxxxx
 ```
 
-Produces: 1 NLB + **0 EIP CRs** (pure path B).
+Produces: 1 NLB + **2 EIP CRs** (BGP PayByTraffic, auto-joined to bandwidth package by NLB).
 
 ### Scenario 4: Giant (4 BGP lanes × 4 ports × 100 slots)
 
@@ -167,12 +161,12 @@ Resource count: 4 NLB × 8 EIP × 100 PA × 400 SG × 1600 Listener. Pre-warming
 
 The operator automatically selects the EIP management path based on `ispType` and `bandwidthPackageId`:
 
-| Scenario | Path | EIP CR | EIP ChargeType |
-|----------|------|--------|----------------|
-| BGP, no bandwidthPackageId | A | Yes | PayByTraffic |
-| BGP + bandwidthPackageId | B | No (NLB auto-creates) | PayByTraffic (joined to package) |
-| Single-ISP, no bandwidthPackageId | A | Yes | PayByBandwidth (default 200Mbps) |
-| Single-ISP + bandwidthPackageId | A+B hybrid | Yes | PayByBandwidth (NLB auto-joins to package) |
+| Scenario | EIP CR | EIP ChargeType | Bandwidth Package |
+|----------|--------|----------------|-------------------|
+| BGP, no bandwidthPackageId | Yes | PayByTraffic | — |
+| BGP + bandwidthPackageId | Yes | PayByTraffic | NLB auto-joins EIP to package |
+| Single-ISP, no bandwidthPackageId | Yes | PayByBandwidth (default 200Mbps) | — |
+| Single-ISP + bandwidthPackageId | Yes | PayByBandwidth | NLB auto-joins EIP to package |
 
 ### NLB EIP constraints (verified)
 
@@ -181,15 +175,15 @@ The operator automatically selects the EIP management path based on `ispType` an
 | BGP / BGP_PRO | ✅ | ❌ `OnlyPayByTrafficSupported` |
 | ChinaTelecom / ChinaUnicom / ChinaMobile | ❌ (not available) | ✅ NLB allows it |
 
-> NLB rejects EIPs that are already in a bandwidth package (`EipAlreadyInBandwidthPackage`). For the A+B hybrid path, the Operator creates EIPs **without** joining them to a bandwidth package first; NLB handles the join automatically when it receives both `AllocationId` and `BandwidthPackageId`.
+> NLB rejects EIPs that are already in a bandwidth package (`EipAlreadyInBandwidthPackage`). The Operator always creates EIPs **without** joining them to a bandwidth package first; NLB handles the join automatically when it receives both `AllocationId` and `BandwidthPackageId`.
 
 ## Verified Test Results (cn-shanghai)
 
 | Scenario | EIP CRs | Bandwidth Packages | NLB | nc 4-lane | Status |
 |----------|---------|-------------------|-----|-----------|--------|
 | 4 ISP lanes, no CBWP | 8 (BGP×2 + CTC×2 + CUC×2 + CMC×2) | None | 4 Active | 4/4 ✅ | Verified |
-| 3 single-ISP CBWP + BGP no CBWP | 8 (single-ISP only) | 3 (CTC+CUC+CMC) | 4 Active | 4/4 ✅ | Verified |
-| All 4 lanes with CBWP | 6 (single-ISP only; BGP skipped) | 4 (BGP+CTC+CUC+CMC) | 4 Active | 4/4 ✅ | Verified |
+| 3 single-ISP CBWP + BGP no CBWP | 8 | 3 (CTC+CUC+CMC) | 4 Active | 4/4 ✅ | Verified |
+| All 4 lanes with CBWP | 16 (2 pools × 8) | 4 (BGP+CTC+CUC+CMC) | 4 Active | 4/4 ✅ | Verified (v0.1.4) |
 | 100-slot giant (4 BGP) | 8 | None | 4 Active | 3/3 ✅ | Verified |
 
 ## API Reference
@@ -214,7 +208,7 @@ The operator automatically selects the EIP management path based on `ispType` an
 |-------|------|----------|-------------|
 | `name` | string | Yes | Lane name, used in CR naming. |
 | `ispType` | string | Yes | ISP type: `BGP`, `BGP_PRO`, `ChinaTelecom`, `ChinaUnicom`, `ChinaMobile`. |
-| `bandwidthPackageId` | string | No | CommonBandwidthPackage ID. BGP lanes: pure path B (NLB auto-creates EIP). Single-ISP lanes: A+B hybrid (Operator creates EIP CR, NLB auto-joins to package). Package ISP must match lane ISP. |
+| `bandwidthPackageId` | string | No | CommonBandwidthPackage ID. When set, NLB receives both AllocationId and BandwidthPackageId and auto-joins the EIP to the package. Package ISP must match lane ISP. |
 | `bandwidth` | string | No | EIP bandwidth peak in Mbps. BGP default: 5 Mbps. Single-ISP default: 200 Mbps. |
 | `securityProtectionTypes` | []string | No | EIP security protection types, e.g., `["AntiDDoS_Enhanced"]`. |
 
@@ -243,8 +237,7 @@ The operator automatically selects the EIP management path based on `ispType` an
 | Resource | Count |
 |----------|-------|
 | NLB | `len(lanes) × ceil((boundSlots + slotsPerNLB × minAvailableNLBs) / slotsPerNLB)` |
-| EIP (path A / A+B) | `NLB_count × len(zoneMaps)` |
-| EIP (pure path B) | Managed by NLB, not tracked as K8s CRs |
+| EIP | `NLB_count × len(zoneMaps)` |
 | PortAllocation | `NLB_groups × slotsPerNLB` |
 | ServerGroup | `PA_count × len(ports)` |
 | Listener | `PA_count × len(ports) × len(lanes)` |
@@ -259,13 +252,13 @@ The operator automatically selects the EIP management path based on `ispType` an
 
 ## How It Works
 
-1. **Pre-warming**: The operator creates NLB and EIP CRs (path A / A+B) or delegates EIP lifecycle to NLB (path B), then creates one PortAllocation CR per slot. The PA Controller provisions a ServerGroup and Listener for each (port, lane) combination.
+1. **Pre-warming**: The operator always creates EIP CRs (ISP-aware: BGP→PayByTraffic, single-ISP→PayByBandwidth) and NLB CRs, then creates one PortAllocation CR per slot. When `bandwidthPackageId` is set, NLB auto-joins EIPs to the package. The PA Controller provisions a ServerGroup and Listener for each (port, lane) combination.
 
 2. **Binding**: The kruise-game V3 plugin watches PortAllocations. When a GameServerSet Pod starts, the plugin claims an available PA, then calls `AddServersToServerGroup` to register the Pod IP. The Pod's `GS.status.networkStatus.externalAddresses` exposes a multi-lane endpoint like `<nlb-bgp>/bgp,<nlb-ctc>/ctc,<nlb-cuc>/cuc,<nlb-cmc>/cmc`.
 
 3. **On-demand Scaling**: When available slots fall below `minAvailableNLBs × slotsPerNLB`, new NLB groups are created. Set `minAvailableNLBs: 0` to lock the pool.
 
-4. **Deletion**: NLB/EIP CRs are deleted first (NLB cascade-deletes Listeners), then PAs (finalizers delete ServerGroups). Path B EIPs are released automatically with NLB. Path A+B EIPs are released via EIP CR deletion.
+4. **Deletion**: NLB/EIP CRs are deleted first (NLB cascade-deletes Listeners), then PAs (finalizers delete ServerGroups). EIPs are released via EIP CR deletion by EIP Operator.
 
 ## License
 
