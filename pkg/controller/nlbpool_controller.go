@@ -537,57 +537,48 @@ func (r *NLBPoolReconciler) ensureNLBsAndEIPs(ctx context.Context, pool *nlbpool
 		for _, lane := range pool.Spec.Lanes {
 			nlbName := r.nlbNameForGroup(pool, lane, nlbGroupIdx)
 
-			// Step 1: Decide whether to create EIP CRs.
-			//   - BGP/BGP_PRO + bandwidthPackageId → pure B path: skip EIP CR, NLB auto-creates BGP EIP
-			//   - BGP/BGP_PRO without bandwidthPackageId → A path: create EIP CR (PayByTraffic)
-			//   - Single-ISP (with or without bandwidthPackageId) → always A path: create EIP CR (PayByBandwidth)
-			//     because NLB can only auto-create BGP EIPs; single-ISP EIPs must be pre-created.
-			//     If bandwidthPackageId is also set, NLB will accept both AllocationId + BandwidthPackageId
-			//     and automatically join the EIP to the bandwidth package (A+B hybrid).
-			isSingleISP := lane.ISPType == "ChinaTelecom" || lane.ISPType == "ChinaUnicom" || lane.ISPType == "ChinaMobile" ||
-				lane.ISPType == "ChinaTelecom_L2" || lane.ISPType == "ChinaUnicom_L2" || lane.ISPType == "ChinaMobile_L2"
-			skipEIPCR := !isSingleISP && lane.BandwidthPackageId != ""
-			var eipAllocationIds []string
-			if !skipEIPCR {
-				eipAllocationIds = make([]string, len(pool.Spec.ZoneMaps))
-				eipsReady := true
-				for zIdx, zone := range pool.Spec.ZoneMaps {
-					eipName := r.eipNameForGroup(pool, lane, nlbGroupIdx, zIdx)
-					eipCR := &eipv1alpha1.EIP{}
-					err := r.Get(ctx, types.NamespacedName{Name: eipName, Namespace: pool.Namespace}, eipCR)
-					if errors.IsNotFound(err) {
-						eipCR = r.buildEIPCR(pool, lane, eipName)
-						if err := controllerutil.SetControllerReference(pool, eipCR, r.Scheme); err != nil {
-							return false, err
-						}
-						if err := r.Create(ctx, eipCR); err != nil && !errors.IsAlreadyExists(err) {
-							return false, err
-						}
-						r.Recorder.Eventf(pool, "Normal", "EIPCreated",
-							"Created EIP CR %s for lane %s zone %s", eipName, lane.Name, zone.Zone)
-						eipsReady = false
-						continue
-					} else if err != nil {
+			// Step 1: Always create EIP CRs. This ensures the EIP ISP matches
+			// lane.ISPType (BGP, BGP_PRO, ChinaTelecom, etc.) regardless of
+			// whether a bandwidth package is configured.
+			// When bandwidthPackageId is also set, NLB receives both AllocationId
+			// and BandwidthPackageId, and auto-joins the EIP to the package.
+			eipAllocationIds := make([]string, len(pool.Spec.ZoneMaps))
+			eipsReady := true
+			for zIdx, zone := range pool.Spec.ZoneMaps {
+				eipName := r.eipNameForGroup(pool, lane, nlbGroupIdx, zIdx)
+				eipCR := &eipv1alpha1.EIP{}
+				err := r.Get(ctx, types.NamespacedName{Name: eipName, Namespace: pool.Namespace}, eipCR)
+				if errors.IsNotFound(err) {
+					eipCR = r.buildEIPCR(pool, lane, eipName)
+					if err := controllerutil.SetControllerReference(pool, eipCR, r.Scheme); err != nil {
 						return false, err
 					}
-
-					// AllocationID is enough; InUse only flips after NLB binds the EIP.
-					if eipCR.Status.AllocationID == "" {
-						eipsReady = false
-						continue
+					if err := r.Create(ctx, eipCR); err != nil && !errors.IsAlreadyExists(err) {
+						return false, err
 					}
-					eipAllocationIds[zIdx] = eipCR.Status.AllocationID
+					r.Recorder.Eventf(pool, "Normal", "EIPCreated",
+						"Created EIP CR %s for lane %s zone %s", eipName, lane.Name, zone.Zone)
+					eipsReady = false
+					continue
+				} else if err != nil {
+					return false, err
 				}
 
-				if !eipsReady {
-					allReady = false
+				if eipCR.Status.AllocationID == "" {
+					eipsReady = false
 					continue
 				}
+				eipAllocationIds[zIdx] = eipCR.Status.AllocationID
 			}
 
-			// Step 2: Ensure NLB CR exists. eipAllocationIds is nil for path B;
-			// buildNLBCR will leave ZoneMappings[].AllocationId empty so the NLB
-			// API auto-creates EIPs joined to BandwidthPackageId.
+			if !eipsReady {
+				allReady = false
+				continue
+			}
+
+			// Step 2: Ensure NLB CR exists with AllocationId per zone.
+			// If bandwidthPackageId is set, NLB also receives it and auto-joins
+			// the EIPs to the bandwidth package.
 			nlbCR := &nlbv1.NLB{}
 			err := r.Get(ctx, types.NamespacedName{Name: nlbName, Namespace: pool.Namespace}, nlbCR)
 			if errors.IsNotFound(err) {
@@ -598,39 +589,31 @@ func (r *NLBPoolReconciler) ensureNLBsAndEIPs(ctx context.Context, pool *nlbpool
 				if err := r.Create(ctx, nlbCR); err != nil && !errors.IsAlreadyExists(err) {
 					return false, err
 				}
-				if lane.BandwidthPackageId != "" {
-					r.Recorder.Eventf(pool, "Normal", "NLBCreated",
-						"Created NLB CR %s for lane %s with bandwidthPackageId %s", nlbName, lane.Name, lane.BandwidthPackageId)
-				} else {
-					r.Recorder.Eventf(pool, "Normal", "NLBCreated",
-						"Created NLB CR %s for lane %s with %d zone EIPs", nlbName, lane.Name, len(eipAllocationIds))
-				}
+				r.Recorder.Eventf(pool, "Normal", "NLBCreated",
+					"Created NLB CR %s for lane %s (ISP=%s) with %d zone EIPs", nlbName, lane.Name, lane.ISPType, len(eipAllocationIds))
 				allReady = false
 				continue
 			} else if err != nil {
 				return false, err
 			}
 
-			// Drift handling: sync AllocationId when EIP CRs exist (path A or A+B hybrid).
-			// Pure B path (BGP + bandwidthPackageId) has nil AllocationId — skip.
-			if !skipEIPCR {
-				needUpdate := false
-				for i := range nlbCR.Spec.ZoneMappings {
-					if i >= len(eipAllocationIds) {
-						break
-					}
-					if eipAllocationIds[i] != "" && nlbCR.Spec.ZoneMappings[i].AllocationId != eipAllocationIds[i] {
-						nlbCR.Spec.ZoneMappings[i].AllocationId = eipAllocationIds[i]
-						needUpdate = true
-					}
+			// Drift handling: ensure each ZoneMapping carries its EIP AllocationId.
+			needUpdate := false
+			for i := range nlbCR.Spec.ZoneMappings {
+				if i >= len(eipAllocationIds) {
+					break
 				}
-				if needUpdate {
-					if err := r.Update(ctx, nlbCR); err != nil {
-						return false, err
-					}
-					r.Recorder.Eventf(pool, "Normal", "NLBUpdated",
-						"Updated NLB CR %s ZoneMappings AllocationIds", nlbName)
+				if eipAllocationIds[i] != "" && nlbCR.Spec.ZoneMappings[i].AllocationId != eipAllocationIds[i] {
+					nlbCR.Spec.ZoneMappings[i].AllocationId = eipAllocationIds[i]
+					needUpdate = true
 				}
+			}
+			if needUpdate {
+				if err := r.Update(ctx, nlbCR); err != nil {
+					return false, err
+				}
+				r.Recorder.Eventf(pool, "Normal", "NLBUpdated",
+					"Updated NLB CR %s ZoneMappings AllocationIds", nlbName)
 			}
 			// NLB Active implies all bound EIPs have flipped to InUse.
 			if nlbCR.Status.LoadBalancerStatus != "Active" {
