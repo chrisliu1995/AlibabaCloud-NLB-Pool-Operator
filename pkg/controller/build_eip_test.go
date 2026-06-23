@@ -2,7 +2,6 @@ package controller
 
 import (
 	"reflect"
-	"strings"
 	"testing"
 
 	nlbpoolv1alpha1 "github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/apis/v1alpha1"
@@ -17,22 +16,26 @@ func TestBuildEIPCR(t *testing.T) {
 	cases := []struct {
 		name          string
 		lane          nlbpoolv1alpha1.LaneConfig
+		wantCharge    string
 		wantBandwidth string
 		wantSecTypes  []string
 	}{
 		{
-			name:          "BGP default (no override)",
+			name:          "BGP default",
 			lane:          nlbpoolv1alpha1.LaneConfig{Name: "bgp-1", ISPType: "BGP"},
+			wantCharge:    "PayByTraffic",
 			wantBandwidth: "",
 		},
 		{
-			name:          "BGP with explicit bandwidth=100",
+			name:          "BGP with bandwidth=100",
 			lane:          nlbpoolv1alpha1.LaneConfig{Name: "bgp-1", ISPType: "BGP", Bandwidth: "100"},
+			wantCharge:    "PayByTraffic",
 			wantBandwidth: "100",
 		},
 		{
 			name:          "BGP_PRO with bandwidth=50",
 			lane:          nlbpoolv1alpha1.LaneConfig{Name: "bgp-pro", ISPType: "BGP_PRO", Bandwidth: "50"},
+			wantCharge:    "PayByTraffic",
 			wantBandwidth: "50",
 		},
 		{
@@ -41,8 +44,33 @@ func TestBuildEIPCR(t *testing.T) {
 				Name: "bgp-1", ISPType: "BGP",
 				SecurityProtectionTypes: []string{"AntiDDoS_Enhanced"},
 			},
+			wantCharge:    "PayByTraffic",
 			wantBandwidth: "",
 			wantSecTypes:  []string{"AntiDDoS_Enhanced"},
+		},
+		{
+			name:          "ChinaTelecom default → PayByBandwidth + 200",
+			lane:          nlbpoolv1alpha1.LaneConfig{Name: "ctc", ISPType: "ChinaTelecom"},
+			wantCharge:    "PayByBandwidth",
+			wantBandwidth: "200",
+		},
+		{
+			name:          "ChinaUnicom with bandwidth=50 → PayByBandwidth + 50",
+			lane:          nlbpoolv1alpha1.LaneConfig{Name: "cuc", ISPType: "ChinaUnicom", Bandwidth: "50"},
+			wantCharge:    "PayByBandwidth",
+			wantBandwidth: "50",
+		},
+		{
+			name:          "ChinaMobile default → PayByBandwidth + 200",
+			lane:          nlbpoolv1alpha1.LaneConfig{Name: "cmc", ISPType: "ChinaMobile"},
+			wantCharge:    "PayByBandwidth",
+			wantBandwidth: "200",
+		},
+		{
+			name:          "ChinaTelecom_L2 default → PayByBandwidth + 200",
+			lane:          nlbpoolv1alpha1.LaneConfig{Name: "ctc-l2", ISPType: "ChinaTelecom_L2"},
+			wantCharge:    "PayByBandwidth",
+			wantBandwidth: "200",
 		},
 	}
 
@@ -51,9 +79,8 @@ func TestBuildEIPCR(t *testing.T) {
 			r := &NLBPoolReconciler{}
 			eip := r.buildEIPCR(pool, tc.lane, "eip-test")
 
-			// buildEIPCR always sets PayByTraffic (single-ISP rejected upstream by CEL)
-			if eip.Spec.InternetChargeType != "PayByTraffic" {
-				t.Errorf("ChargeType: want PayByTraffic got %q", eip.Spec.InternetChargeType)
+			if eip.Spec.InternetChargeType != tc.wantCharge {
+				t.Errorf("ChargeType: want %q got %q", tc.wantCharge, eip.Spec.InternetChargeType)
 			}
 			if eip.Spec.Bandwidth != tc.wantBandwidth {
 				t.Errorf("Bandwidth: want %q got %q", tc.wantBandwidth, eip.Spec.Bandwidth)
@@ -68,66 +95,60 @@ func TestBuildEIPCR(t *testing.T) {
 	}
 }
 
+func TestIsSingleISP(t *testing.T) {
+	cases := []struct {
+		ispType string
+		want    bool
+	}{
+		{"BGP", false},
+		{"BGP_PRO", false},
+		{"ChinaTelecom", true},
+		{"ChinaUnicom", true},
+		{"ChinaMobile", true},
+		{"ChinaTelecom_L2", true},
+		{"ChinaUnicom_L2", true},
+		{"ChinaMobile_L2", true},
+		{"Unknown", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.ispType, func(t *testing.T) {
+			if got := isSingleISP(tc.ispType); got != tc.want {
+				t.Errorf("isSingleISP(%q) = %v, want %v", tc.ispType, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestValidateLaneConfig(t *testing.T) {
 	cases := []struct {
-		name          string
-		lanes         []nlbpoolv1alpha1.LaneConfig
-		wantMsgSubstr string // empty = expect no error
+		name  string
+		lanes []nlbpoolv1alpha1.LaneConfig
 	}{
 		{
-			name: "all BGP, all valid",
-			lanes: []nlbpoolv1alpha1.LaneConfig{
-				{Name: "bgp-1", ISPType: "BGP"},
-				{Name: "bgp-2", ISPType: "BGP_PRO", Bandwidth: "100"},
-			},
+			name:  "all BGP",
+			lanes: []nlbpoolv1alpha1.LaneConfig{{Name: "bgp", ISPType: "BGP"}},
 		},
 		{
-			name: "BGP with optional bandwidthPackageId (path B for BGP)",
-			lanes: []nlbpoolv1alpha1.LaneConfig{
-				{Name: "bgp-cbwp", ISPType: "BGP", BandwidthPackageId: "cbwp-foo"},
-			},
+			name:  "ChinaTelecom without bandwidthPackageId (valid — direct EIP path)",
+			lanes: []nlbpoolv1alpha1.LaneConfig{{Name: "ctc", ISPType: "ChinaTelecom"}},
 		},
 		{
-			name: "ChinaTelecom with bandwidthPackageId (valid path B)",
-			lanes: []nlbpoolv1alpha1.LaneConfig{
-				{Name: "ctc", ISPType: "ChinaTelecom", BandwidthPackageId: "cbwp-foo"},
-			},
+			name:  "ChinaTelecom with bandwidthPackageId (valid — A+B hybrid)",
+			lanes: []nlbpoolv1alpha1.LaneConfig{{Name: "ctc", ISPType: "ChinaTelecom", BandwidthPackageId: "cbwp-foo"}},
 		},
 		{
-			name: "ChinaTelecom without bandwidthPackageId (invalid)",
+			name: "mixed lanes all valid",
 			lanes: []nlbpoolv1alpha1.LaneConfig{
-				{Name: "ctc-bad", ISPType: "ChinaTelecom"},
+				{Name: "bgp", ISPType: "BGP", BandwidthPackageId: "cbwp-bgp"},
+				{Name: "ctc", ISPType: "ChinaTelecom"},
+				{Name: "cmc", ISPType: "ChinaMobile", BandwidthPackageId: "cbwp-cm"},
 			},
-			wantMsgSubstr: "lane ctc-bad uses single-ISP ChinaTelecom",
-		},
-		{
-			name: "ChinaUnicom_L2 without bandwidthPackageId (L2 variant also single-ISP)",
-			lanes: []nlbpoolv1alpha1.LaneConfig{
-				{Name: "cu-l2", ISPType: "ChinaUnicom_L2"},
-			},
-			wantMsgSubstr: "lane cu-l2 uses single-ISP ChinaUnicom_L2",
-		},
-		{
-			name: "mixed: 1 BGP + 1 single-ISP invalid (reports first invalid)",
-			lanes: []nlbpoolv1alpha1.LaneConfig{
-				{Name: "bgp-1", ISPType: "BGP"},
-				{Name: "cm-bad", ISPType: "ChinaMobile"},
-			},
-			wantMsgSubstr: "lane cm-bad uses single-ISP ChinaMobile",
 		},
 	}
-
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := validateLaneConfig(tc.lanes)
-			if tc.wantMsgSubstr == "" {
-				if got != "" {
-					t.Errorf("expected empty (valid), got %q", got)
-				}
-			} else {
-				if !strings.Contains(got, tc.wantMsgSubstr) {
-					t.Errorf("expected substring %q in %q", tc.wantMsgSubstr, got)
-				}
+			if msg := validateLaneConfig(tc.lanes); msg != "" {
+				t.Errorf("unexpected validation error: %s", msg)
 			}
 		})
 	}

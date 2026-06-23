@@ -537,11 +537,18 @@ func (r *NLBPoolReconciler) ensureNLBsAndEIPs(ctx context.Context, pool *nlbpool
 		for _, lane := range pool.Spec.Lanes {
 			nlbName := r.nlbNameForGroup(pool, lane, nlbGroupIdx)
 
-			// Step 1: For path A (independent EIP), ensure one EIP CR per zone.
-			// For path B (shared bandwidth package), skip — NLB will auto-create
-			// PayByTraffic EIPs and join them to the bandwidth package.
+			// Step 1: Decide whether to create EIP CRs.
+			//   - BGP/BGP_PRO + bandwidthPackageId → pure B path: skip EIP CR, NLB auto-creates BGP EIP
+			//   - BGP/BGP_PRO without bandwidthPackageId → A path: create EIP CR (PayByTraffic)
+			//   - Single-ISP (with or without bandwidthPackageId) → always A path: create EIP CR (PayByBandwidth)
+			//     because NLB can only auto-create BGP EIPs; single-ISP EIPs must be pre-created.
+			//     If bandwidthPackageId is also set, NLB will accept both AllocationId + BandwidthPackageId
+			//     and automatically join the EIP to the bandwidth package (A+B hybrid).
+			isSingleISP := lane.ISPType == "ChinaTelecom" || lane.ISPType == "ChinaUnicom" || lane.ISPType == "ChinaMobile" ||
+				lane.ISPType == "ChinaTelecom_L2" || lane.ISPType == "ChinaUnicom_L2" || lane.ISPType == "ChinaMobile_L2"
+			skipEIPCR := !isSingleISP && lane.BandwidthPackageId != ""
 			var eipAllocationIds []string
-			if lane.BandwidthPackageId == "" {
+			if !skipEIPCR {
 				eipAllocationIds = make([]string, len(pool.Spec.ZoneMaps))
 				eipsReady := true
 				for zIdx, zone := range pool.Spec.ZoneMaps {
@@ -604,9 +611,9 @@ func (r *NLBPoolReconciler) ensureNLBsAndEIPs(ctx context.Context, pool *nlbpool
 				return false, err
 			}
 
-			// Drift handling: only for path A (independent EIP). Path B's NLB
-			// has nil AllocationId by design — nothing to sync.
-			if lane.BandwidthPackageId == "" {
+			// Drift handling: sync AllocationId when EIP CRs exist (path A or A+B hybrid).
+			// Pure B path (BGP + bandwidthPackageId) has nil AllocationId — skip.
+			if !skipEIPCR {
 				needUpdate := false
 				for i := range nlbCR.Spec.ZoneMappings {
 					if i >= len(eipAllocationIds) {
@@ -799,43 +806,42 @@ func (r *NLBPoolReconciler) buildNLBCR(
 // empty string when all lanes are valid; otherwise a human-readable
 // message describing the first violation.
 //
-// Single-ISP lanes (ChinaTelecom/Unicom/Mobile and their L2 variants)
-// require BandwidthPackageId because NLB rejects direct attachment of
-// single-ISP EIPs (OperationDenied.OnlyPayByTrafficSupported). The CRD
-// CEL rule on LaneConfig enforces the same invariant at API server level;
-// this function exists for clusters where CEL is disabled or for older
-// K8s versions.
+// validateLaneConfig validates lane configurations. Returns empty string
+// when valid; otherwise a human-readable message. Currently no blocking
+// validations — single-ISP lanes work both with and without bandwidthPackageId.
 func validateLaneConfig(lanes []nlbpoolv1alpha1.LaneConfig) string {
-	singleISP := map[string]bool{
-		"ChinaTelecom":    true,
-		"ChinaUnicom":     true,
-		"ChinaMobile":     true,
-		"ChinaTelecom_L2": true,
-		"ChinaUnicom_L2":  true,
-		"ChinaMobile_L2":  true,
-	}
-	for _, lane := range lanes {
-		if singleISP[lane.ISPType] && lane.BandwidthPackageId == "" {
-			return fmt.Sprintf("lane %s uses single-ISP %s but no bandwidthPackageId; NLB rejects direct single-ISP EIPs. Set spec.lanes[].bandwidthPackageId to a CommonBandwidthPackage with matching ISP.",
-				lane.Name, lane.ISPType)
-		}
-	}
 	return ""
 }
 
-// buildEIPCR builds an independent EIP CR (path A). Only called when
-// lane.BandwidthPackageId is empty — path B (NLB auto-creates EIP and
-// joins it to the shared bandwidth package) skips EIP CR entirely.
+// isSingleISP returns true for single-line ISP types that require
+// PayByBandwidth EIPs (ChinaTelecom, ChinaUnicom, ChinaMobile and L2 variants).
+func isSingleISP(ispType string) bool {
+	switch ispType {
+	case "ChinaTelecom", "ChinaUnicom", "ChinaMobile",
+		"ChinaTelecom_L2", "ChinaUnicom_L2", "ChinaMobile_L2":
+		return true
+	}
+	return false
+}
+
+// buildEIPCR builds an independent EIP CR (path A).
 //
-// NLB requires PayByTraffic for independently-attached EIPs (cross-region
-// verified; see nlb-eip-charge-constraint memory), so we hard-code it here.
-// Single-ISP lanes are rejected upstream by CRD CEL validation, so we
-// don't need to handle PayByBandwidth at all.
+// Charge type is ISP-aware:
+//   - BGP/BGP_PRO → PayByTraffic (NLB rejects BGP PayByBandwidth EIPs)
+//   - Single-ISP → PayByBandwidth (only option; NLB specially allows it)
 func (r *NLBPoolReconciler) buildEIPCR(
 	pool *nlbpoolv1alpha1.NLBPool,
 	lane nlbpoolv1alpha1.LaneConfig,
 	eipName string,
 ) *eipv1alpha1.EIP {
+	chargeType := "PayByTraffic"
+	bandwidth := lane.Bandwidth
+	if isSingleISP(lane.ISPType) {
+		chargeType = "PayByBandwidth"
+		if bandwidth == "" {
+			bandwidth = "200"
+		}
+	}
 	return &eipv1alpha1.EIP{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      eipName,
@@ -848,8 +854,8 @@ func (r *NLBPoolReconciler) buildEIPCR(
 		Spec: eipv1alpha1.EIPSpec{
 			Name:                    eipName,
 			ISP:                     lane.ISPType,
-			InternetChargeType:      "PayByTraffic",
-			Bandwidth:               lane.Bandwidth,
+			InternetChargeType:      chargeType,
+			Bandwidth:               bandwidth,
 			SecurityProtectionTypes: lane.SecurityProtectionTypes,
 		},
 	}

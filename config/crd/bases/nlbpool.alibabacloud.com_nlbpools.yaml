@@ -70,15 +70,16 @@ spec:
                   properties:
                     bandwidth:
                       description: |-
-                        Bandwidth 独立 EIP 的带宽峰值，单位 Mbps（仅 PayByTraffic 独立 EIP 路径生效）。
-                        与 BandwidthPackageId 互斥：填了 BandwidthPackageId 时此字段被忽略。
-                        未填时使用云端 PayByTraffic 默认 5 Mbps 峰值。
+                        Bandwidth EIP 带宽峰值，单位 Mbps。
+                        BGP/BGP_PRO（PayByTraffic）：未填时云端默认 5 Mbps 峰值。
+                        单线 ISP（PayByBandwidth）：未填时默认 200 Mbps。
                       type: string
                     bandwidthPackageId:
                       description: |-
                         BandwidthPackageId 共享带宽包 ID（CommonBandwidthPackage）。
-                        填了之后 NLB 自动建 PayByTraffic EIP 并加入此带宽包，实际计费走带宽包。
-                        单线 ISP（ChinaTelecom/Unicom/Mobile）场景必须填此字段（NLB 直接拒绝单线 EIP）。
+                        BGP lane：NLB 跳过 EIP CR，自动建 BGP PayByTraffic EIP 加入带宽包（纯 B 路径）。
+                        单线 ISP lane：Operator 先建独立 EIP CR（PayByBandwidth），NLB 同时传
+                          AllocationId + BandwidthPackageId，由 NLB 将 EIP 加入带宽包（A+B 混合路径）。
                         带宽包的 ISP 必须与 lane.ISPType 一致。
                       type: string
                     ispType:
@@ -89,9 +90,7 @@ spec:
                       description: Name lane名称，用于CR命名
                       type: string
                     securityProtectionTypes:
-                      description: |-
-                        SecurityProtectionTypes EIP 安全防护类型，例如 ["AntiDDoS_Enhanced"]。
-                        仅独立 EIP 路径生效（不填 BandwidthPackageId 时）。
+                      description: SecurityProtectionTypes EIP 安全防护类型，例如 ["AntiDDoS_Enhanced"]。
                       items:
                         type: string
                       type: array
@@ -99,13 +98,6 @@ spec:
                   - ispType
                   - name
                   type: object
-                  x-kubernetes-validations:
-                  - message: single-ISP lanes (ChinaTelecom/ChinaUnicom/ChinaMobile
-                      and their L2 variants) require spec.lanes[].bandwidthPackageId;
-                      NLB cannot directly attach single-ISP EIPs (use a CommonBandwidthPackage
-                      with matching ISP instead)
-                    rule: '!(self.ispType in [''ChinaTelecom'',''ChinaUnicom'',''ChinaMobile'',''ChinaTelecom_L2'',''ChinaUnicom_L2'',''ChinaMobile_L2''])
-                      || has(self.bandwidthPackageId)'
                 type: array
               minAvailableNLBs:
                 description: MinAvailableNLBs 最小空闲NLB实例数（以NLB为粒度预热）
