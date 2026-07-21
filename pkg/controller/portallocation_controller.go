@@ -1218,11 +1218,7 @@ func (r *PortAllocationReconciler) handleReleasing(ctx context.Context, pa *nlbp
 				}
 				pa.Status.ServerGroups[i].ServerStatus = ""
 			} else {
-				// Server still exists — reset to retry RemoveServer next reconcile
-				if err := r.patchServerStatus(ctx, pa, i, "Bound"); err != nil {
-					return ctrl.Result{Requeue: true}, nil
-				}
-				pa.Status.ServerGroups[i].ServerStatus = "Bound"
+				// Server still present in SG — async removal in progress, keep Removing and wait
 				allClear = false
 			}
 
@@ -1260,6 +1256,15 @@ func (r *PortAllocationReconciler) handleReleasing(ctx context.Context, pa *nlbp
 					allClear = false
 					continue
 				}
+				// Server is in async "Removing" state — treat as in-progress, not an error
+				if isIncorrectStatusBackendServerError(err) {
+					if patchErr := r.patchServerStatus(ctx, pa, i, "Removing"); patchErr != nil {
+						return ctrl.Result{Requeue: true}, nil
+					}
+					pa.Status.ServerGroups[i].ServerStatus = "Removing"
+					allClear = false
+					continue
+				}
 				r.eventf(pa, corev1.EventTypeWarning, "RemoveServerFailed",
 					"Failed to remove server from SG %s: %v", sg.ServerGroupId, err)
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
@@ -1274,7 +1279,7 @@ func (r *PortAllocationReconciler) handleReleasing(ctx context.Context, pa *nlbp
 	}
 
 	if !allClear {
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
 	r.clearPodClaim(ctx, pa)
@@ -1363,6 +1368,15 @@ func (r *PortAllocationReconciler) handleDisable(ctx context.Context, pa *nlbpoo
 				}
 				if isDuplicatedServerError(err) {
 					if err := r.patchServerStatus(ctx, pa, i, "Removing"); err != nil {
+						return ctrl.Result{Requeue: true}, nil
+					}
+					pa.Status.ServerGroups[i].ServerStatus = "Removing"
+					allClear = false
+					continue
+				}
+				// Server is in async "Removing" state — treat as in-progress
+				if isIncorrectStatusBackendServerError(err) {
+					if patchErr := r.patchServerStatus(ctx, pa, i, "Removing"); patchErr != nil {
 						return ctrl.Result{Requeue: true}, nil
 					}
 					pa.Status.ServerGroups[i].ServerStatus = "Removing"
@@ -1500,6 +1514,9 @@ func (r *PortAllocationReconciler) removeServers(ctx context.Context, pa *nlbpoo
 		if _, err := r.NLBClient.RemoveServersFromServerGroup(ctx, req); err != nil {
 			if isServerNotFoundError(err) || isDuplicatedServerError(err) {
 				continue
+			}
+			if isIncorrectStatusBackendServerError(err) {
+				continue // Server already in async removal, skip
 			}
 			if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
 				removeThrottled = true
@@ -1676,6 +1693,16 @@ func isServerNotFoundError(err error) bool {
 		strings.Contains(msg, "InvalidParam.Server") ||
 		strings.Contains(msg, "ResourceNotFound.Server") ||
 		strings.Contains(msg, "ResourceNotFound.BackendServer")
+}
+
+// isIncorrectStatusBackendServerError checks if the error is due to the backend server
+// being in an intermediate state (e.g. "Removing"), which means the operation is already
+// in progress asynchronously and should not be retried immediately.
+func isIncorrectStatusBackendServerError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "IncorrectStatus.BackendServer")
 }
 
 // ---------------------------------------------------------------------------
