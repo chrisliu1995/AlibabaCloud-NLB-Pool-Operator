@@ -1227,9 +1227,10 @@ func (r *PortAllocationReconciler) handleBound(ctx context.Context, pa *nlbpoolv
 						ServerIp:   s.ServerIp,
 						Port:       s.Port,
 					}},
+					ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "heal-remove", sg.ServerGroupId, s.ServerIp),
 				}
 				if _, err := r.NLBClient.RemoveServersFromServerGroup(ctx, removeReq); err != nil {
-					if !isServerNotFoundError(err) {
+					if !isServerNotFoundError(err) && !isIncorrectStatusError(err) {
 						r.eventf(pa, corev1.EventTypeWarning, "RemoveStaleServerFailed",
 							"Failed to remove stale server %s from SG %s: %v", s.ServerIp, sg.ServerGroupId, err)
 					}
