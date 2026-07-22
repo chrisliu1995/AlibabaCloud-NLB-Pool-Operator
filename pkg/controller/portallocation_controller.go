@@ -1190,33 +1190,35 @@ func (r *PortAllocationReconciler) handleBound(ctx context.Context, pa *nlbpoolv
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	// Not yet verified — check each SG for server consistency.
-	// Process one SG per reconcile to avoid API rate limiting.
+	// === One-time self-healing: batch-verify all SGs ===
 	expectedIP := pa.Spec.BoundPodIP
 	if expectedIP == "" {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
+
+	needsRequeue := false
 
 	for _, sg := range pa.Status.ServerGroups {
 		if sg.ServerGroupId == "" {
 			continue
 		}
 
-		// Query actual servers in this SG
+		// List servers in this SG
 		servers, err := r.NLBClient.ListServerGroupServers(ctx, sg.ServerGroupId)
 		if err != nil {
 			if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
-				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+				// Rate limited — requeue and try later
+				needsRequeue = true
+				break
 			}
-			// Other errors — retry later
 			logger.Error(err, "healBound: ListServerGroupServers failed", "sg", sg.ServerGroupId)
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			needsRequeue = true
+			break
 		}
 
-		// Check for stale servers (IP != expectedIP)
+		// Remove stale servers (IP != expectedIP)
 		for _, s := range servers {
 			if s.ServerIp != expectedIP {
-				// Found a stale server, remove it
 				r.eventf(pa, corev1.EventTypeWarning, "StaleServerDetected",
 					"SG %s has stale server %s (expected %s), removing", sg.ServerGroupId, s.ServerIp, expectedIP)
 				removeReq := &provider.RemoveServersRequest{
@@ -1230,17 +1232,23 @@ func (r *PortAllocationReconciler) handleBound(ctx context.Context, pa *nlbpoolv
 					ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "heal-remove", sg.ServerGroupId, s.ServerIp),
 				}
 				if _, err := r.NLBClient.RemoveServersFromServerGroup(ctx, removeReq); err != nil {
+					if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
+						needsRequeue = true
+						break
+					}
 					if !isServerNotFoundError(err) && !isIncorrectStatusError(err) {
 						r.eventf(pa, corev1.EventTypeWarning, "RemoveStaleServerFailed",
 							"Failed to remove stale server %s from SG %s: %v", s.ServerIp, sg.ServerGroupId, err)
 					}
 				}
-				// Processed one SG, requeue to continue
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+				needsRequeue = true // modified, need next reconcile to confirm
 			}
 		}
+		if needsRequeue {
+			break
+		}
 
-		// Check if expected IP is present in this SG
+		// Check if expected IP is present
 		found := false
 		for _, s := range servers {
 			if s.ServerIp == expectedIP {
@@ -1249,7 +1257,6 @@ func (r *PortAllocationReconciler) handleBound(ctx context.Context, pa *nlbpoolv
 			}
 		}
 		if !found {
-			// Expected IP is missing, add it
 			port := r.lookupContainerPortForSG(pa, sg.Name)
 			r.eventf(pa, corev1.EventTypeWarning, "MissingServerDetected",
 				"SG %s missing expected server %s, adding", sg.ServerGroupId, expectedIP)
@@ -1262,20 +1269,25 @@ func (r *PortAllocationReconciler) handleBound(ctx context.Context, pa *nlbpoolv
 					Port:       port,
 					Weight:     100,
 				}},
-				ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "heal", sg.ServerGroupId, expectedIP),
+				ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "heal-add", sg.ServerGroupId, expectedIP),
 			}
 			if _, err := r.NLBClient.AddServersToServerGroup(ctx, addReq); err != nil {
-				if !isDuplicatedServerError(err) {
-					r.eventf(pa, corev1.EventTypeWarning, "AddMissingServerFailed",
-						"Failed to add missing server %s to SG %s: %v", expectedIP, sg.ServerGroupId, err)
+				if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
+					needsRequeue = true
+					break
 				}
+				r.eventf(pa, corev1.EventTypeWarning, "AddMissingServerFailed",
+					"Failed to add missing server %s to SG %s: %v", expectedIP, sg.ServerGroupId, err)
 			}
-			// Processed one SG, requeue to continue
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			needsRequeue = true // modified, need next reconcile to confirm
 		}
 	}
 
-	// All SGs verified and consistent — mark as verified
+	if needsRequeue {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	// All SGs verified clean — mark as verified
 	logger.Info("healBound: all SGs verified, marking sg-verified annotation", "pa", pa.Name)
 	patch := client.MergeFrom(pa.DeepCopy())
 	if pa.Annotations == nil {
