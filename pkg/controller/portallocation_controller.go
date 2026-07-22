@@ -1044,49 +1044,19 @@ func (r *PortAllocationReconciler) availableResumeBind(ctx context.Context, pa *
 
 func (r *PortAllocationReconciler) handleBinding(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation) (ctrl.Result, error) {
 	if pa.Spec.BoundPodIP == "" {
-		pa.Status.Phase = nlbpoolv1alpha1.PortAllocationReleasing
-		pa.Status.Message = "Binding aborted: No pod IP, aborting binding"
-		if err := r.Status().Update(ctx, pa); err != nil {
-			if errors.IsConflict(err) {
-				return ctrl.Result{Requeue: true}, nil
-			}
-			return ctrl.Result{}, err
-		}
-		r.updatePhaseLabel(ctx, pa)
-		r.eventf(pa, corev1.EventTypeNormal, "BindingAborted", "No pod IP, aborting binding, entering cleanup")
-		return ctrl.Result{Requeue: true}, nil
+		return r.resetToAvailable(ctx, pa, "No pod IP for binding")
 	}
 
 	// Dual verification before calling cloud API.
 	pod := &corev1.Pod{}
 	if err := r.Get(ctx, types.NamespacedName{Name: pa.Spec.BoundPod, Namespace: pa.Namespace}, pod); err != nil {
 		if errors.IsNotFound(err) {
-			pa.Status.Phase = nlbpoolv1alpha1.PortAllocationReleasing
-			pa.Status.Message = "Binding aborted: Pod not found, aborting binding"
-			if err := r.Status().Update(ctx, pa); err != nil {
-				if errors.IsConflict(err) {
-					return ctrl.Result{Requeue: true}, nil
-				}
-				return ctrl.Result{}, err
-			}
-			r.updatePhaseLabel(ctx, pa)
-			r.eventf(pa, corev1.EventTypeNormal, "BindingAborted", "Pod not found, aborting binding, entering cleanup")
-			return ctrl.Result{Requeue: true}, nil
+			return r.resetToAvailable(ctx, pa, "Pod not found before binding")
 		}
 		return ctrl.Result{}, err
 	}
 	if pod.Annotations[nlbpoolv1alpha1.AnnotationPAClaim] != pa.Name {
-		pa.Status.Phase = nlbpoolv1alpha1.PortAllocationReleasing
-		pa.Status.Message = "Binding aborted: Pod claim mismatch, aborting binding"
-		if err := r.Status().Update(ctx, pa); err != nil {
-			if errors.IsConflict(err) {
-				return ctrl.Result{Requeue: true}, nil
-			}
-			return ctrl.Result{}, err
-		}
-		r.updatePhaseLabel(ctx, pa)
-		r.eventf(pa, corev1.EventTypeNormal, "BindingAborted", "Pod claim mismatch, aborting binding, entering cleanup")
-		return ctrl.Result{Requeue: true}, nil
+		return r.resetToAvailable(ctx, pa, "Pod claim mismatch before cloud API call")
 	}
 
 	allBound := true
@@ -1186,6 +1156,7 @@ func (r *PortAllocationReconciler) handleBinding(ctx context.Context, pa *nlbpoo
 }
 
 func (r *PortAllocationReconciler) handleBound(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
 	pod := &corev1.Pod{}
 	err := r.Get(ctx, types.NamespacedName{Name: pa.Spec.BoundPod, Namespace: pa.Namespace}, pod)
 	if errors.IsNotFound(err) {
@@ -1210,6 +1181,112 @@ func (r *PortAllocationReconciler) handleBound(ctx context.Context, pa *nlbpoolv
 		r.eventf(pa, corev1.EventTypeNormal, "DedupRelease",
 			"Pod %s claim is %q, not %s; releasing", pod.Name, claim, pa.Name)
 		return r.startReleasing(ctx, pa)
+	}
+
+	// === One-time self-healing: verify SG servers match boundPodIP ===
+	// If already verified, skip reconciliation.
+	if pa.Annotations != nil && pa.Annotations["nlbpool.alibabacloud.com/sg-verified"] == "true" {
+		// Already verified, normal periodic requeue.
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	// Not yet verified — check each SG for server consistency.
+	// Process one SG per reconcile to avoid API rate limiting.
+	expectedIP := pa.Spec.BoundPodIP
+	if expectedIP == "" {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	for _, sg := range pa.Status.ServerGroups {
+		if sg.ServerGroupId == "" {
+			continue
+		}
+
+		// Query actual servers in this SG
+		servers, err := r.NLBClient.ListServerGroupServers(ctx, sg.ServerGroupId)
+		if err != nil {
+			if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
+				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+			}
+			// Other errors — retry later
+			logger.Error(err, "healBound: ListServerGroupServers failed", "sg", sg.ServerGroupId)
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+
+		// Check for stale servers (IP != expectedIP)
+		for _, s := range servers {
+			if s.ServerIp != expectedIP {
+				// Found a stale server, remove it
+				r.eventf(pa, corev1.EventTypeWarning, "StaleServerDetected",
+					"SG %s has stale server %s (expected %s), removing", sg.ServerGroupId, s.ServerIp, expectedIP)
+				removeReq := &provider.RemoveServersRequest{
+					ServerGroupId: sg.ServerGroupId,
+					Servers: []provider.BackendServer{{
+						ServerType: "Ip",
+						ServerId:   s.ServerIp,
+						ServerIp:   s.ServerIp,
+						Port:       s.Port,
+					}},
+				}
+				if _, err := r.NLBClient.RemoveServersFromServerGroup(ctx, removeReq); err != nil {
+					if !isServerNotFoundError(err) {
+						r.eventf(pa, corev1.EventTypeWarning, "RemoveStaleServerFailed",
+							"Failed to remove stale server %s from SG %s: %v", s.ServerIp, sg.ServerGroupId, err)
+					}
+				}
+				// Processed one SG, requeue to continue
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+		}
+
+		// Check if expected IP is present in this SG
+		found := false
+		for _, s := range servers {
+			if s.ServerIp == expectedIP {
+				found = true
+				break
+			}
+		}
+		if !found {
+			// Expected IP is missing, add it
+			port := r.lookupContainerPortForSG(pa, sg.Name)
+			r.eventf(pa, corev1.EventTypeWarning, "MissingServerDetected",
+				"SG %s missing expected server %s, adding", sg.ServerGroupId, expectedIP)
+			addReq := &provider.AddServersRequest{
+				ServerGroupId: sg.ServerGroupId,
+				Servers: []provider.BackendServer{{
+					ServerType: "Ip",
+					ServerId:   expectedIP,
+					ServerIp:   expectedIP,
+					Port:       port,
+					Weight:     100,
+				}},
+				ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "heal", sg.ServerGroupId, expectedIP),
+			}
+			if _, err := r.NLBClient.AddServersToServerGroup(ctx, addReq); err != nil {
+				if !isDuplicatedServerError(err) {
+					r.eventf(pa, corev1.EventTypeWarning, "AddMissingServerFailed",
+						"Failed to add missing server %s to SG %s: %v", expectedIP, sg.ServerGroupId, err)
+				}
+			}
+			// Processed one SG, requeue to continue
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+	}
+
+	// All SGs verified and consistent — mark as verified
+	logger.Info("healBound: all SGs verified, marking sg-verified annotation", "pa", pa.Name)
+	patch := client.MergeFrom(pa.DeepCopy())
+	if pa.Annotations == nil {
+		pa.Annotations = make(map[string]string)
+	}
+	pa.Annotations["nlbpool.alibabacloud.com/sg-verified"] = "true"
+	if err := r.Patch(ctx, pa, patch); err != nil {
+		if errors.IsConflict(err) {
+			return ctrl.Result{Requeue: true}, nil
+		}
+		logger.Error(err, "healBound: failed to patch sg-verified annotation")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	// Binding is stable. Periodic requeue to detect Pod deletion if watch event is lost.
@@ -1248,7 +1325,11 @@ func (r *PortAllocationReconciler) handleReleasing(ctx context.Context, pa *nlbp
 				}
 				pa.Status.ServerGroups[i].ServerStatus = ""
 			} else {
-				// Server still present in SG — async removal in progress, keep Removing and wait
+				// Server still exists — reset to retry RemoveServer next reconcile
+				if err := r.patchServerStatus(ctx, pa, i, "Bound"); err != nil {
+					return ctrl.Result{Requeue: true}, nil
+				}
+				pa.Status.ServerGroups[i].ServerStatus = "Bound"
 				allClear = false
 			}
 
@@ -1286,15 +1367,6 @@ func (r *PortAllocationReconciler) handleReleasing(ctx context.Context, pa *nlbp
 					allClear = false
 					continue
 				}
-				// Server is in async "Removing" state — treat as in-progress, not an error
-				if isIncorrectStatusBackendServerError(err) {
-					if patchErr := r.patchServerStatus(ctx, pa, i, "Removing"); patchErr != nil {
-						return ctrl.Result{Requeue: true}, nil
-					}
-					pa.Status.ServerGroups[i].ServerStatus = "Removing"
-					allClear = false
-					continue
-				}
 				r.eventf(pa, corev1.EventTypeWarning, "RemoveServerFailed",
 					"Failed to remove server from SG %s: %v", sg.ServerGroupId, err)
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
@@ -1309,7 +1381,7 @@ func (r *PortAllocationReconciler) handleReleasing(ctx context.Context, pa *nlbp
 	}
 
 	if !allClear {
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	r.clearPodClaim(ctx, pa)
@@ -1536,9 +1608,6 @@ func (r *PortAllocationReconciler) removeServers(ctx context.Context, pa *nlbpoo
 			if isServerNotFoundError(err) || isDuplicatedServerError(err) {
 				continue
 			}
-			if isIncorrectStatusBackendServerError(err) {
-				continue // Server already in async removal, skip
-			}
 			if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
 				removeThrottled = true
 				continue
@@ -1714,16 +1783,6 @@ func isServerNotFoundError(err error) bool {
 		strings.Contains(msg, "InvalidParam.Server") ||
 		strings.Contains(msg, "ResourceNotFound.Server") ||
 		strings.Contains(msg, "ResourceNotFound.BackendServer")
-}
-
-// isIncorrectStatusBackendServerError checks if the error is due to the backend server
-// being in an intermediate state (e.g. "Removing"), which means the operation is already
-// in progress asynchronously and should not be retried immediately.
-func isIncorrectStatusBackendServerError(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(err.Error(), "IncorrectStatus.BackendServer")
 }
 
 // ---------------------------------------------------------------------------
