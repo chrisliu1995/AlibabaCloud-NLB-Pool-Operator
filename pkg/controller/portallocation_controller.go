@@ -1044,19 +1044,49 @@ func (r *PortAllocationReconciler) availableResumeBind(ctx context.Context, pa *
 
 func (r *PortAllocationReconciler) handleBinding(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation) (ctrl.Result, error) {
 	if pa.Spec.BoundPodIP == "" {
-		return r.resetToAvailable(ctx, pa, "No pod IP for binding")
+		pa.Status.Phase = nlbpoolv1alpha1.PortAllocationReleasing
+		pa.Status.Message = "Binding aborted: No pod IP, aborting binding"
+		if err := r.Status().Update(ctx, pa); err != nil {
+			if errors.IsConflict(err) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, err
+		}
+		r.updatePhaseLabel(ctx, pa)
+		r.eventf(pa, corev1.EventTypeNormal, "BindingAborted", "No pod IP, aborting binding, entering cleanup")
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// Dual verification before calling cloud API.
 	pod := &corev1.Pod{}
 	if err := r.Get(ctx, types.NamespacedName{Name: pa.Spec.BoundPod, Namespace: pa.Namespace}, pod); err != nil {
 		if errors.IsNotFound(err) {
-			return r.resetToAvailable(ctx, pa, "Pod not found before binding")
+			pa.Status.Phase = nlbpoolv1alpha1.PortAllocationReleasing
+			pa.Status.Message = "Binding aborted: Pod not found, aborting binding"
+			if err := r.Status().Update(ctx, pa); err != nil {
+				if errors.IsConflict(err) {
+					return ctrl.Result{Requeue: true}, nil
+				}
+				return ctrl.Result{}, err
+			}
+			r.updatePhaseLabel(ctx, pa)
+			r.eventf(pa, corev1.EventTypeNormal, "BindingAborted", "Pod not found, aborting binding, entering cleanup")
+			return ctrl.Result{Requeue: true}, nil
 		}
 		return ctrl.Result{}, err
 	}
 	if pod.Annotations[nlbpoolv1alpha1.AnnotationPAClaim] != pa.Name {
-		return r.resetToAvailable(ctx, pa, "Pod claim mismatch before cloud API call")
+		pa.Status.Phase = nlbpoolv1alpha1.PortAllocationReleasing
+		pa.Status.Message = "Binding aborted: Pod claim mismatch, aborting binding"
+		if err := r.Status().Update(ctx, pa); err != nil {
+			if errors.IsConflict(err) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, err
+		}
+		r.updatePhaseLabel(ctx, pa)
+		r.eventf(pa, corev1.EventTypeNormal, "BindingAborted", "Pod claim mismatch, aborting binding, entering cleanup")
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	allBound := true
@@ -1368,15 +1398,6 @@ func (r *PortAllocationReconciler) handleDisable(ctx context.Context, pa *nlbpoo
 				}
 				if isDuplicatedServerError(err) {
 					if err := r.patchServerStatus(ctx, pa, i, "Removing"); err != nil {
-						return ctrl.Result{Requeue: true}, nil
-					}
-					pa.Status.ServerGroups[i].ServerStatus = "Removing"
-					allClear = false
-					continue
-				}
-				// Server is in async "Removing" state — treat as in-progress
-				if isIncorrectStatusBackendServerError(err) {
-					if patchErr := r.patchServerStatus(ctx, pa, i, "Removing"); patchErr != nil {
 						return ctrl.Result{Requeue: true}, nil
 					}
 					pa.Status.ServerGroups[i].ServerStatus = "Removing"
