@@ -859,6 +859,78 @@ func (r *PortAllocationReconciler) computeProvisioningAggregates(pa *nlbpoolv1al
 }
 
 func (r *PortAllocationReconciler) handleAvailable(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation) (ctrl.Result, error) {
+	// === One-time SG cleanup for Available PA ===
+	// Available PA should have empty SGs (no servers registered).
+	// Skip if already verified.
+	if pa.Annotations == nil || pa.Annotations["nlbpool.alibabacloud.com/sg-verified"] != "true" {
+		// Only clean if boundPodIP is empty (confirms PA is truly available, not mid-claim)
+		if pa.Spec.BoundPodIP == "" {
+			needsRequeue := false
+
+			for _, sg := range pa.Status.ServerGroups {
+				if sg.ServerGroupId == "" {
+					continue
+				}
+
+				servers, err := r.NLBClient.ListServerGroupServers(ctx, sg.ServerGroupId)
+				if err != nil {
+					if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
+						needsRequeue = true
+						break
+					}
+					// Other error, skip this check for now
+					needsRequeue = true
+					break
+				}
+
+				// Any server in this SG is stale (Available PA should have empty SGs)
+				for _, s := range servers {
+					r.eventf(pa, corev1.EventTypeWarning, "AvailableStaleServer",
+						"Available PA has stale server %s in SG %s, removing", s.ServerIp, sg.ServerGroupId)
+					removeReq := &provider.RemoveServersRequest{
+						ServerGroupId: sg.ServerGroupId,
+						Servers: []provider.BackendServer{{
+							ServerType: "Ip",
+							ServerId:   s.ServerIp,
+							ServerIp:   s.ServerIp,
+							Port:       s.Port,
+						}},
+						ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "avail-clean", sg.ServerGroupId, s.ServerIp),
+					}
+					if _, err := r.NLBClient.RemoveServersFromServerGroup(ctx, removeReq); err != nil {
+						if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
+							needsRequeue = true
+							break
+						}
+						if !isServerNotFoundError(err) && !isIncorrectStatusError(err) {
+							r.eventf(pa, corev1.EventTypeWarning, "AvailableCleanFailed",
+								"Failed to remove stale server %s from SG %s: %v", s.ServerIp, sg.ServerGroupId, err)
+						}
+					}
+					needsRequeue = true
+				}
+				if needsRequeue {
+					break
+				}
+			}
+
+			if needsRequeue {
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			}
+
+			// All SGs confirmed empty — mark verified
+			patch := client.MergeFrom(pa.DeepCopy())
+			if pa.Annotations == nil {
+				pa.Annotations = make(map[string]string)
+			}
+			pa.Annotations["nlbpool.alibabacloud.com/sg-verified"] = "true"
+			if err := r.Patch(ctx, pa, patch); err != nil {
+				// Non-fatal, will retry next reconcile
+				return ctrl.Result{Requeue: true}, nil
+			}
+		}
+	}
+
 	// --- Phase A: PA already has a BoundPod (resume after partial bind) ---
 	if pa.Spec.BoundPod != "" {
 		return r.availableResumeBind(ctx, pa)
@@ -1190,35 +1262,33 @@ func (r *PortAllocationReconciler) handleBound(ctx context.Context, pa *nlbpoolv
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	// === One-time self-healing: batch-verify all SGs ===
+	// Not yet verified — check each SG for server consistency.
+	// Process one SG per reconcile to avoid API rate limiting.
 	expectedIP := pa.Spec.BoundPodIP
 	if expectedIP == "" {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
-
-	needsRequeue := false
 
 	for _, sg := range pa.Status.ServerGroups {
 		if sg.ServerGroupId == "" {
 			continue
 		}
 
-		// List servers in this SG
+		// Query actual servers in this SG
 		servers, err := r.NLBClient.ListServerGroupServers(ctx, sg.ServerGroupId)
 		if err != nil {
 			if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
-				// Rate limited — requeue and try later
-				needsRequeue = true
-				break
+				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 			}
+			// Other errors — retry later
 			logger.Error(err, "healBound: ListServerGroupServers failed", "sg", sg.ServerGroupId)
-			needsRequeue = true
-			break
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
 
-		// Remove stale servers (IP != expectedIP)
+		// Check for stale servers (IP != expectedIP)
 		for _, s := range servers {
 			if s.ServerIp != expectedIP {
+				// Found a stale server, remove it
 				r.eventf(pa, corev1.EventTypeWarning, "StaleServerDetected",
 					"SG %s has stale server %s (expected %s), removing", sg.ServerGroupId, s.ServerIp, expectedIP)
 				removeReq := &provider.RemoveServersRequest{
@@ -1232,23 +1302,17 @@ func (r *PortAllocationReconciler) handleBound(ctx context.Context, pa *nlbpoolv
 					ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "heal-remove", sg.ServerGroupId, s.ServerIp),
 				}
 				if _, err := r.NLBClient.RemoveServersFromServerGroup(ctx, removeReq); err != nil {
-					if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
-						needsRequeue = true
-						break
-					}
 					if !isServerNotFoundError(err) && !isIncorrectStatusError(err) {
 						r.eventf(pa, corev1.EventTypeWarning, "RemoveStaleServerFailed",
 							"Failed to remove stale server %s from SG %s: %v", s.ServerIp, sg.ServerGroupId, err)
 					}
 				}
-				needsRequeue = true // modified, need next reconcile to confirm
+				// Processed one SG, requeue to continue
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
 		}
-		if needsRequeue {
-			break
-		}
 
-		// Check if expected IP is present
+		// Check if expected IP is present in this SG
 		found := false
 		for _, s := range servers {
 			if s.ServerIp == expectedIP {
@@ -1257,6 +1321,7 @@ func (r *PortAllocationReconciler) handleBound(ctx context.Context, pa *nlbpoolv
 			}
 		}
 		if !found {
+			// Expected IP is missing, add it
 			port := r.lookupContainerPortForSG(pa, sg.Name)
 			r.eventf(pa, corev1.EventTypeWarning, "MissingServerDetected",
 				"SG %s missing expected server %s, adding", sg.ServerGroupId, expectedIP)
@@ -1269,25 +1334,20 @@ func (r *PortAllocationReconciler) handleBound(ctx context.Context, pa *nlbpoolv
 					Port:       port,
 					Weight:     100,
 				}},
-				ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "heal-add", sg.ServerGroupId, expectedIP),
+				ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "heal", sg.ServerGroupId, expectedIP),
 			}
 			if _, err := r.NLBClient.AddServersToServerGroup(ctx, addReq); err != nil {
-				if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
-					needsRequeue = true
-					break
+				if !isDuplicatedServerError(err) {
+					r.eventf(pa, corev1.EventTypeWarning, "AddMissingServerFailed",
+						"Failed to add missing server %s to SG %s: %v", expectedIP, sg.ServerGroupId, err)
 				}
-				r.eventf(pa, corev1.EventTypeWarning, "AddMissingServerFailed",
-					"Failed to add missing server %s to SG %s: %v", expectedIP, sg.ServerGroupId, err)
 			}
-			needsRequeue = true // modified, need next reconcile to confirm
+			// Processed one SG, requeue to continue
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 	}
 
-	if needsRequeue {
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-	}
-
-	// All SGs verified clean — mark as verified
+	// All SGs verified and consistent — mark as verified
 	logger.Info("healBound: all SGs verified, marking sg-verified annotation", "pa", pa.Name)
 	patch := client.MergeFrom(pa.DeepCopy())
 	if pa.Annotations == nil {
