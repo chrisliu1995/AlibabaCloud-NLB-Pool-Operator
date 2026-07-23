@@ -1044,19 +1044,49 @@ func (r *PortAllocationReconciler) availableResumeBind(ctx context.Context, pa *
 
 func (r *PortAllocationReconciler) handleBinding(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation) (ctrl.Result, error) {
 	if pa.Spec.BoundPodIP == "" {
-		return r.resetToAvailable(ctx, pa, "No pod IP for binding")
+		pa.Status.Phase = nlbpoolv1alpha1.PortAllocationReleasing
+		pa.Status.Message = "Binding aborted: No pod IP, aborting binding"
+		if err := r.Status().Update(ctx, pa); err != nil {
+			if errors.IsConflict(err) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, err
+		}
+		r.updatePhaseLabel(ctx, pa)
+		r.eventf(pa, corev1.EventTypeNormal, "BindingAborted", "No pod IP, aborting binding, entering cleanup")
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// Dual verification before calling cloud API.
 	pod := &corev1.Pod{}
 	if err := r.Get(ctx, types.NamespacedName{Name: pa.Spec.BoundPod, Namespace: pa.Namespace}, pod); err != nil {
 		if errors.IsNotFound(err) {
-			return r.resetToAvailable(ctx, pa, "Pod not found before binding")
+			pa.Status.Phase = nlbpoolv1alpha1.PortAllocationReleasing
+			pa.Status.Message = "Binding aborted: Pod not found, aborting binding"
+			if err := r.Status().Update(ctx, pa); err != nil {
+				if errors.IsConflict(err) {
+					return ctrl.Result{Requeue: true}, nil
+				}
+				return ctrl.Result{}, err
+			}
+			r.updatePhaseLabel(ctx, pa)
+			r.eventf(pa, corev1.EventTypeNormal, "BindingAborted", "Pod not found, aborting binding, entering cleanup")
+			return ctrl.Result{Requeue: true}, nil
 		}
 		return ctrl.Result{}, err
 	}
 	if pod.Annotations[nlbpoolv1alpha1.AnnotationPAClaim] != pa.Name {
-		return r.resetToAvailable(ctx, pa, "Pod claim mismatch before cloud API call")
+		pa.Status.Phase = nlbpoolv1alpha1.PortAllocationReleasing
+		pa.Status.Message = "Binding aborted: Pod claim mismatch, aborting binding"
+		if err := r.Status().Update(ctx, pa); err != nil {
+			if errors.IsConflict(err) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, err
+		}
+		r.updatePhaseLabel(ctx, pa)
+		r.eventf(pa, corev1.EventTypeNormal, "BindingAborted", "Pod claim mismatch, aborting binding, entering cleanup")
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	allBound := true
@@ -1218,11 +1248,7 @@ func (r *PortAllocationReconciler) handleReleasing(ctx context.Context, pa *nlbp
 				}
 				pa.Status.ServerGroups[i].ServerStatus = ""
 			} else {
-				// Server still exists — reset to retry RemoveServer next reconcile
-				if err := r.patchServerStatus(ctx, pa, i, "Bound"); err != nil {
-					return ctrl.Result{Requeue: true}, nil
-				}
-				pa.Status.ServerGroups[i].ServerStatus = "Bound"
+				// Server still present in SG — async removal in progress, keep Removing and wait
 				allClear = false
 			}
 
@@ -1260,6 +1286,15 @@ func (r *PortAllocationReconciler) handleReleasing(ctx context.Context, pa *nlbp
 					allClear = false
 					continue
 				}
+				// Server is in async "Removing" state — treat as in-progress, not an error
+				if isIncorrectStatusBackendServerError(err) {
+					if patchErr := r.patchServerStatus(ctx, pa, i, "Removing"); patchErr != nil {
+						return ctrl.Result{Requeue: true}, nil
+					}
+					pa.Status.ServerGroups[i].ServerStatus = "Removing"
+					allClear = false
+					continue
+				}
 				r.eventf(pa, corev1.EventTypeWarning, "RemoveServerFailed",
 					"Failed to remove server from SG %s: %v", sg.ServerGroupId, err)
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
@@ -1274,7 +1309,7 @@ func (r *PortAllocationReconciler) handleReleasing(ctx context.Context, pa *nlbp
 	}
 
 	if !allClear {
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
 	r.clearPodClaim(ctx, pa)
@@ -1501,6 +1536,9 @@ func (r *PortAllocationReconciler) removeServers(ctx context.Context, pa *nlbpoo
 			if isServerNotFoundError(err) || isDuplicatedServerError(err) {
 				continue
 			}
+			if isIncorrectStatusBackendServerError(err) {
+				continue // Server already in async removal, skip
+			}
 			if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
 				removeThrottled = true
 				continue
@@ -1676,6 +1714,16 @@ func isServerNotFoundError(err error) bool {
 		strings.Contains(msg, "InvalidParam.Server") ||
 		strings.Contains(msg, "ResourceNotFound.Server") ||
 		strings.Contains(msg, "ResourceNotFound.BackendServer")
+}
+
+// isIncorrectStatusBackendServerError checks if the error is due to the backend server
+// being in an intermediate state (e.g. "Removing"), which means the operation is already
+// in progress asynchronously and should not be retried immediately.
+func isIncorrectStatusBackendServerError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "IncorrectStatus.BackendServer")
 }
 
 // ---------------------------------------------------------------------------
