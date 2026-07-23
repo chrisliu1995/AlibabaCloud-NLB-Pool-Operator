@@ -1217,104 +1217,74 @@ func (r *PortAllocationReconciler) handleBound(ctx context.Context, pa *nlbpoolv
 }
 
 func (r *PortAllocationReconciler) handleReleasing(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation) (ctrl.Result, error) {
-	if pa.Spec.BoundPodIP == "" {
-		r.clearPodClaim(ctx, pa)
-		return r.resetToAvailable(ctx, pa, "Released, ready for rebinding")
-	}
-
 	allClear := true
+
 	for i, sg := range pa.Status.ServerGroups {
 		if sg.ServerGroupId == "" {
 			continue
 		}
 
-		switch sg.ServerStatus {
-		case "", "None":
+		// SG already confirmed empty (idempotent: skip repeated List calls)
+		if sg.ServerStatus == "" {
 			continue
+		}
 
-		case "Removing":
-			// Poll: check if server is actually gone from cloud SG
-			found, err := r.isServerInSG(ctx, sg.ServerGroupId, pa.Spec.BoundPodIP)
-			if err != nil {
-				if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
-					allClear = false
-					continue
-				}
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-			}
-			if !found {
-				if err := r.patchServerStatus(ctx, pa, i, ""); err != nil {
-					return ctrl.Result{Requeue: true}, nil
-				}
-				pa.Status.ServerGroups[i].ServerStatus = ""
-			} else {
-				// Server still present in SG — async removal in progress, keep Removing and wait
+		// SG not yet confirmed empty: List cloud-side actual state
+		servers, err := r.NLBClient.ListServerGroupServers(ctx, sg.ServerGroupId)
+		if err != nil {
+			if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
 				allClear = false
+				continue
 			}
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
 
-		default: // "Bound" or "Adding" — need to remove
-			port := r.lookupContainerPortForSG(pa, sg.Name)
-			req := &provider.RemoveServersRequest{
+		if len(servers) == 0 {
+			// SG is empty, mark as confirmed
+			if err := r.patchServerStatus(ctx, pa, i, ""); err != nil {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			pa.Status.ServerGroups[i].ServerStatus = ""
+			continue
+		}
+
+		// SG has servers - remove them using List-returned IP+Port (not BoundPodIP)
+		for _, s := range servers {
+			removeReq := &provider.RemoveServersRequest{
 				ServerGroupId: sg.ServerGroupId,
 				Servers: []provider.BackendServer{{
 					ServerType: "Ip",
-					ServerId:   pa.Spec.BoundPodIP,
-					ServerIp:   pa.Spec.BoundPodIP,
-					Port:       port,
-					Weight:     100,
+					ServerId:   s.ServerIp,
+					ServerIp:   s.ServerIp,
+					Port:       s.Port,
 				}},
-				ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "remove", sg.ServerGroupId, pa.Spec.BoundPodIP, pa.ResourceVersion),
+				ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "release", sg.ServerGroupId, s.ServerIp),
 			}
-			if _, err := r.NLBClient.RemoveServersFromServerGroup(ctx, req); err != nil {
-				if isServerNotFoundError(err) {
-					if err := r.patchServerStatus(ctx, pa, i, ""); err != nil {
-						return ctrl.Result{Requeue: true}, nil
-					}
-					pa.Status.ServerGroups[i].ServerStatus = ""
-					continue
-				}
+			if _, err := r.NLBClient.RemoveServersFromServerGroup(ctx, removeReq); err != nil {
 				if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
-					// Request rejected, don't change status, retry next reconcile
 					allClear = false
-					continue
+					break // rate limited, stop this SG, retry next reconcile
 				}
-				if isDuplicatedServerError(err) {
-					if err := r.patchServerStatus(ctx, pa, i, "Removing"); err != nil {
-						return ctrl.Result{Requeue: true}, nil
-					}
-					pa.Status.ServerGroups[i].ServerStatus = "Removing"
-					allClear = false
-					continue
+				if isServerNotFoundError(err) || isIncorrectStatusBackendServerError(err) {
+					continue // server already gone or async-removing, skip
 				}
-				// Server is in async "Removing" state — treat as in-progress, not an error
-				if isIncorrectStatusBackendServerError(err) {
-					if patchErr := r.patchServerStatus(ctx, pa, i, "Removing"); patchErr != nil {
-						return ctrl.Result{Requeue: true}, nil
-					}
-					pa.Status.ServerGroups[i].ServerStatus = "Removing"
-					allClear = false
-					continue
-				}
+				// Other error: record event, continue with next server
 				r.eventf(pa, corev1.EventTypeWarning, "RemoveServerFailed",
-					"Failed to remove server from SG %s: %v", sg.ServerGroupId, err)
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+					"Failed to remove server %s from SG %s: %v", s.ServerIp, sg.ServerGroupId, err)
 			}
-			// API accepted, mark Removing (will verify next reconcile)
-			if err := r.patchServerStatus(ctx, pa, i, "Removing"); err != nil {
-				return ctrl.Result{Requeue: true}, nil
-			}
-			pa.Status.ServerGroups[i].ServerStatus = "Removing"
-			allClear = false
 		}
+		allClear = false // Had servers this round, need requeue to List-confirm removal
 	}
 
 	if !allClear {
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
+	// All SGs confirmed empty - clear Pod claim and transition to Available
 	r.clearPodClaim(ctx, pa)
 	return r.resetToAvailable(ctx, pa, "Released, ready for rebinding")
 }
+
 
 func (r *PortAllocationReconciler) handleDisabled(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation) (ctrl.Result, error) {
 	pod := &corev1.Pod{}
@@ -1475,6 +1445,11 @@ func (r *PortAllocationReconciler) resetToAvailable(ctx context.Context, pa *nlb
 			return ctrl.Result{Requeue: true}, nil
 		}
 		return ctrl.Result{}, err
+	}
+
+	// Clear all ServerStatus to ensure CR cleanliness for Available state
+	for i := range pa.Status.ServerGroups {
+		pa.Status.ServerGroups[i].ServerStatus = ""
 	}
 
 	pa.Status.Phase = nlbpoolv1alpha1.PortAllocationAvailable
