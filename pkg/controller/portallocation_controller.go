@@ -1216,8 +1216,32 @@ func (r *PortAllocationReconciler) handleBound(ctx context.Context, pa *nlbpoolv
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
+// annReleasingSince records when the current Releasing cycle started; used
+// for age-based requeue backoff and stuck-release alarms. Cleared by
+// resetToAvailable when the PA leaves Releasing.
+const annReleasingSince = "nlbpool.alibabacloud.com/releasing-since"
+
 func (r *PortAllocationReconciler) handleReleasing(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation) (ctrl.Result, error) {
+	// Record when this Releasing cycle started (lazily, once)
+	releasingSince := time.Now()
+	if v, ok := pa.Annotations[annReleasingSince]; ok {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			releasingSince = t
+		}
+	} else {
+		patch := client.MergeFrom(pa.DeepCopy())
+		if pa.Annotations == nil {
+			pa.Annotations = make(map[string]string)
+		}
+		pa.Annotations[annReleasingSince] = releasingSince.Format(time.RFC3339)
+		if err := r.Patch(ctx, pa, patch); err != nil {
+			return ctrl.Result{Requeue: true}, nil
+		}
+	}
+	releasingAge := time.Since(releasingSince)
+
 	allClear := true
+	rateLimitedThisCycle := false
 
 	for i, sg := range pa.Status.ServerGroups {
 		if sg.ServerGroupId == "" {
@@ -1233,6 +1257,9 @@ func (r *PortAllocationReconciler) handleReleasing(ctx context.Context, pa *nlbp
 		servers, err := r.NLBClient.ListServerGroupServers(ctx, sg.ServerGroupId)
 		if err != nil {
 			if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
+				if provider.IsLocalRateLimited(err) {
+					rateLimitedThisCycle = true
+				}
 				allClear = false
 				continue
 			}
@@ -1258,10 +1285,17 @@ func (r *PortAllocationReconciler) handleReleasing(ctx context.Context, pa *nlbp
 					ServerIp:   s.ServerIp,
 					Port:       s.Port,
 				}},
-				ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "release", sg.ServerGroupId, s.ServerIp),
+				// Time-bucketed token: retries within the same minute stay
+				// deduplicated by the cloud idempotency cache, while later
+				// retries carry a new token and force a real re-execution
+				// (identical tokens only replay the cached response).
+				ClientToken: r.generateClientToken(pa.Namespace, pa.Name, "release", sg.ServerGroupId, s.ServerIp, strconv.FormatInt(time.Now().Unix()/60, 10)),
 			}
 			if _, err := r.NLBClient.RemoveServersFromServerGroup(ctx, removeReq); err != nil {
 				if provider.IsLocalRateLimited(err) || isThrottlingError(err) {
+					if provider.IsLocalRateLimited(err) {
+						rateLimitedThisCycle = true
+					}
 					allClear = false
 					break // rate limited, stop this SG, retry next reconcile
 				}
@@ -1277,7 +1311,29 @@ func (r *PortAllocationReconciler) handleReleasing(ctx context.Context, pa *nlbp
 	}
 
 	if !allClear {
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		// Age-based backoff: avoid a flat 10s hot loop burning API quota
+		// when the release is stuck for a long time.
+		requeue := 10 * time.Second
+		switch {
+		case releasingAge > 30*time.Minute:
+			requeue = 5 * time.Minute
+		case releasingAge > 10*time.Minute:
+			requeue = time.Minute
+		case releasingAge > 2*time.Minute:
+			requeue = 30 * time.Second
+		}
+		// Stuck alarm: over 15 minutes in Releasing
+		if releasingAge > 15*time.Minute {
+			r.eventf(pa, corev1.EventTypeWarning, "StuckReleasing",
+				"PA stuck in Releasing for %s; some SGs still have backends or calls are rate limited", releasingAge.Round(time.Minute))
+		}
+		// Silent local token-bucket starvation is otherwise invisible
+		// (requests are rejected before leaving the client).
+		if rateLimitedThisCycle && releasingAge > 5*time.Minute {
+			r.eventf(pa, corev1.EventTypeWarning, "ReleaseRateLimited",
+				"Release calls are being rejected by client-side rate limiter for %s", releasingAge.Round(time.Minute))
+		}
+		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
 	// All SGs confirmed empty - clear Pod claim and transition to Available
@@ -1440,6 +1496,8 @@ func (r *PortAllocationReconciler) resetToAvailable(ctx context.Context, pa *nlb
 
 	pa.Spec.BoundPod = ""
 	pa.Spec.BoundPodIP = ""
+	// Clear the Releasing lifecycle marker; annotations persist with this Update.
+	delete(pa.Annotations, annReleasingSince)
 	if err := r.Update(ctx, pa); err != nil {
 		if errors.IsConflict(err) {
 			return ctrl.Result{Requeue: true}, nil
