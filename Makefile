@@ -21,6 +21,14 @@ BINARY_NAME = manager
 CONTROLLER_GEN ?= $(shell pwd)/bin/controller-gen
 CONTROLLER_GEN_VERSION ?= v0.16.5
 
+# Tool versions. Pinned rather than @latest so CI does not break when a tool
+# raises its minimum Go version.
+GOVULNCHECK_VERSION ?= v1.6.0
+# Go version used to build helper tools and to resolve the standard library
+# during vulnerability scanning. Must be a patched release, otherwise
+# govulncheck reports stdlib CVEs fixed in later patches.
+TOOL_GOTOOLCHAIN ?= go1.25.12
+
 .PHONY: all
 all: build
 
@@ -111,8 +119,8 @@ scan-secrets:
 
 .PHONY: scan-vulns
 scan-vulns:
-	@echo "Running dependency vulnerability scan (govulncheck)..."
-	@GOTOOLCHAIN=$(GOTOOLCHAIN) $(GO) run golang.org/x/vuln/cmd/govulncheck@latest ./...
+	@echo "Running dependency vulnerability scan (govulncheck $(GOVULNCHECK_VERSION))..."
+	@GOTOOLCHAIN=$(TOOL_GOTOOLCHAIN) $(GO) run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 
 .PHONY: docker-build
 docker-build:
@@ -162,7 +170,7 @@ TMP_DIR=$$(mktemp -d 2>/dev/null || mktemp -d -t tool) ;\
 cd $$TMP_DIR ;\
 go mod init tmp ;\
 echo "Downloading $(2)" ;\
-GOTOOLCHAIN=go1.23.4 GOBIN=$$(dirname "$(1)") go install "$(2)" ;\
+GOTOOLCHAIN=$(TOOL_GOTOOLCHAIN) GOBIN=$$(dirname "$(1)") go install "$(2)" ;\
 rm -rf $$TMP_DIR ;\
 }
 endef

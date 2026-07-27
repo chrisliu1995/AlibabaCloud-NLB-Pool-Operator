@@ -1,7 +1,7 @@
 # VARIANT: multi-arch build via DaoCloud mirror (linux/amd64 + linux/arm64).
 # Use with `docker buildx`. Authoritative single-arch entry: ./Dockerfile.
 # Build stage
-FROM m.daocloud.io/docker.io/library/golang:1.23 AS builder
+FROM m.daocloud.io/docker.io/library/golang:1.25 AS builder
 
 WORKDIR /workspace
 

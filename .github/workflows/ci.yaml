@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # Must stay a patched release and match TOOL_GOTOOLCHAIN in the Makefile,
+  # otherwise govulncheck reports stdlib CVEs fixed in later patches.
+  GO_VERSION: "1.25.12"
+
 jobs:
   test:
     name: Vet and Test
@@ -18,7 +23,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_VERSION }}
           cache: true
 
       - name: go vet
@@ -35,7 +40,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_VERSION }}
           cache: true
 
       - name: make verify
@@ -56,7 +61,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_VERSION }}
           cache: true
 
       - name: Dependency vulnerability scan (govulncheck)
