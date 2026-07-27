@@ -48,11 +48,25 @@ The recommended way is via the unified Helm chart:
 git clone https://github.com/chrisliu1995/AlibabaCloud-Operator-Charts.git
 cd AlibabaCloud-Operator-Charts
 
-helm install alibabacloud-operators . \
-  --set global.alibabacloud.accessKeyId="$AK" \
-  --set global.alibabacloud.accessKeySecret="$SK" \
-  --set global.alibabacloud.region=cn-shanghai
+# Write credentials to a local values file instead of --set flags:
+# --set expands plaintext into the process command line (visible in `ps`).
+cat > ./credentials.yaml <<'EOF'
+global:
+  alibabacloud:
+    accessKeyId: <ACCESS_KEY_ID>
+    accessKeySecret: <ACCESS_KEY_SECRET>
+    region: cn-shanghai
+EOF
+chmod 600 ./credentials.yaml
+
+helm install alibabacloud-operators . -f ./credentials.yaml
+rm -f ./credentials.yaml
 ```
+
+> Security note: any value passed to Helm (via `--set` or `-f`) persists in the
+> release values and is readable via `helm get values`. If the chart supports
+> referencing a pre-created Kubernetes Secret (e.g. `existingSecret`), prefer
+> that over inline credentials.
 
 This installs NLB Operator, EIP Operator, NLB Pool Operator, and all CRDs in one step. See the [chart repo](https://github.com/chrisliu1995/AlibabaCloud-Operator-Charts) for `values.yaml` options.
 
@@ -258,7 +272,7 @@ The operator automatically selects the EIP management path based on `ispType` an
 
 3. **On-demand Scaling**: When available slots fall below `minAvailableNLBs × slotsPerNLB`, new NLB groups are created. Set `minAvailableNLBs: 0` to lock the pool.
 
-4. **Deletion**: NLB/EIP CRs are deleted first (NLB cascade-deletes Listeners), then PAs (finalizers delete ServerGroups). EIPs are released via EIP CR deletion by EIP Operator.
+4. **Deletion**: NLB/EIP CRs are deleted first (NLB cascade-deletes Listeners), then PAs (finalizers delete ServerGroups). EIPs are released via EIP CR deletion by EIP Operator. Deletion destroys real cloud resources; see [docs/deletion-safety.md](docs/deletion-safety.md) for the dry-run preview, the deletion-protection approval gate, and the recovery procedure.
 
 ## License
 

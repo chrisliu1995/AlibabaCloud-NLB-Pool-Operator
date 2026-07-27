@@ -1341,7 +1341,6 @@ func (r *PortAllocationReconciler) handleReleasing(ctx context.Context, pa *nlbp
 	return r.resetToAvailable(ctx, pa, "Released, ready for rebinding")
 }
 
-
 func (r *PortAllocationReconciler) handleDisabled(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation) (ctrl.Result, error) {
 	pod := &corev1.Pod{}
 	err := r.Get(ctx, types.NamespacedName{Name: pa.Spec.BoundPod, Namespace: pa.Namespace}, pod)

@@ -1,3 +1,6 @@
+# VARIANT: packages a HOST-PREBUILT ./manager binary (no in-image build).
+# For local dev iteration: `GOOS=linux GOARCH=amd64 go build -o manager .`
+# then `docker build -f Dockerfile.local .`. Authoritative entry: ./Dockerfile.
 FROM registry.cn-hangzhou.aliyuncs.com/acs/alpine:3.18-update
 RUN apk --no-cache add ca-certificates bash
 WORKDIR /
