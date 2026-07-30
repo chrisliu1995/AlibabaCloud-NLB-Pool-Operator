@@ -1,3 +1,6 @@
+# VARIANT: release packaging of a HOST-PREBUILT ./manager binary.
+# Identical runtime base to Dockerfile.local; kept for release pipelines
+# that build the binary outside Docker. Authoritative entry: ./Dockerfile.
 FROM registry.cn-hangzhou.aliyuncs.com/acs/alpine:3.18-update
 RUN apk --no-cache add ca-certificates bash
 WORKDIR /

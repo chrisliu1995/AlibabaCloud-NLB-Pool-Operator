@@ -8,6 +8,9 @@ bin/
 # Backup files
 *.bak
 
+# Local credentials (copy from .env.example)
+.env
+
 # IDE / OS
 .idea/
 .vscode/

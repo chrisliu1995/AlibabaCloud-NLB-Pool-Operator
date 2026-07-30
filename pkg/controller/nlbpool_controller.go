@@ -69,6 +69,29 @@ func (r *NLBPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	//   Phase 3: Delete PAs → PA finalizer only needs to delete SGs (no ResourceInUse)
 	if !pool.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(pool, nlbpoolv1alpha1.FinalizerNLBPool) {
+			// Safety gate 1: deletion protection (approval annotation).
+			// Default off — only blocks when explicitly set to "true".
+			if pool.Annotations[nlbpoolv1alpha1.AnnotationDeletionProtection] == "true" {
+				plan := r.buildDeletionPlan(ctx, pool)
+				r.Recorder.Eventf(pool, "Warning", "DeletionBlocked",
+					"Cascade deletion blocked by %s=true; remove the annotation to approve. Pending plan: %s",
+					nlbpoolv1alpha1.AnnotationDeletionProtection, plan)
+				logger.Info("cascade deletion blocked by deletion-protection annotation",
+					"pool", pool.Name, "plan", plan)
+				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+			}
+
+			// Safety gate 2: dry-run. Emit the deletion plan without executing.
+			if pool.Annotations[nlbpoolv1alpha1.AnnotationDeletionDryRun] == "true" {
+				plan := r.buildDeletionPlan(ctx, pool)
+				r.Recorder.Eventf(pool, "Normal", "DeletionDryRun",
+					"Dry-run: cascade deletion NOT executed. Plan: %s. Remove %s to proceed.",
+					plan, nlbpoolv1alpha1.AnnotationDeletionDryRun)
+				logger.Info("deletion dry-run, no resources deleted",
+					"pool", pool.Name, "plan", plan)
+				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+			}
+
 			if pool.Status.Phase != nlbpoolv1alpha1.NLBPoolDeleting {
 				pool.Status.Phase = nlbpoolv1alpha1.NLBPoolDeleting
 				pool.Status.Message = "Deleting child resources"
@@ -237,6 +260,54 @@ func (r *NLBPoolReconciler) nlbNameForGroup(pool *nlbpoolv1alpha1.NLBPool, lane 
 // eipNameForGroup returns the EIP CR name for a given lane, group, and zone.
 func (r *NLBPoolReconciler) eipNameForGroup(pool *nlbpoolv1alpha1.NLBPool, lane nlbpoolv1alpha1.LaneConfig, groupIdx int32, zoneIdx int) string {
 	return fmt.Sprintf("%s-%s-%d-z%d", pool.Name, lane.Name, groupIdx, zoneIdx)
+}
+
+// buildDeletionPlan lists every child CR that a cascade deletion would
+// remove and returns a human-readable summary. Read-only: used by the
+// dry-run and deletion-protection safety gates.
+func (r *NLBPoolReconciler) buildDeletionPlan(ctx context.Context, pool *nlbpoolv1alpha1.NLBPool) string {
+	sel := client.MatchingLabels{nlbpoolv1alpha1.LabelPool: pool.Name}
+	ns := client.InNamespace(pool.Namespace)
+
+	var nlbs, eips, sgs, lsns, pas int
+	var cloudNLBIds []string
+
+	nlbList := &nlbv1.NLBList{}
+	if err := r.List(ctx, nlbList, ns, sel); err == nil {
+		for i := range nlbList.Items {
+			if !metav1.IsControlledBy(&nlbList.Items[i], pool) {
+				continue
+			}
+			nlbs++
+			if id := nlbList.Items[i].Status.LoadBalancerId; id != "" {
+				cloudNLBIds = append(cloudNLBIds, id)
+			}
+		}
+	}
+	eipList := &eipv1alpha1.EIPList{}
+	if err := r.List(ctx, eipList, ns, sel); err == nil {
+		for i := range eipList.Items {
+			if metav1.IsControlledBy(&eipList.Items[i], pool) {
+				eips++
+			}
+		}
+	}
+	sgList := &nlbv1.ServerGroupList{}
+	if err := r.List(ctx, sgList, ns, sel); err == nil {
+		sgs = len(sgList.Items)
+	}
+	lsnList := &nlbv1.ListenerList{}
+	if err := r.List(ctx, lsnList, ns, sel); err == nil {
+		lsns = len(lsnList.Items)
+	}
+	paList := &nlbpoolv1alpha1.PortAllocationList{}
+	if err := r.List(ctx, paList, ns, sel); err == nil {
+		pas = len(paList.Items)
+	}
+
+	return fmt.Sprintf(
+		"%d NLB CR(s) (cloud: %v), %d EIP CR(s), %d ServerGroup CR(s), %d Listener CR(s), %d PortAllocation(s) with their cloud SGs/Listeners",
+		nlbs, cloudNLBIds, eips, sgs, lsns, pas)
 }
 
 // deleteAllChildren proactively triggers deletion of every child CR owned by

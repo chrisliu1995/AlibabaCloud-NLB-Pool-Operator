@@ -1,5 +1,7 @@
+# AUTHORITATIVE build entry. Used by `make docker-build`.
+# Other Dockerfile.* files are scenario-specific variants; see their headers.
 # Build stage
-FROM golang:1.23 AS builder
+FROM golang:1.25 AS builder
 
 WORKDIR /workspace
 

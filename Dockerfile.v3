@@ -1,5 +1,9 @@
+# VARIANT (deprecated): v3-era build via Huawei Cloud mirror.
+# Superseded by ./Dockerfile; kept only for historical reproduction.
+# NOTE: go.mod requires Go 1.25; verify this tag exists in the mirror before
+# relying on this variant.
 # Build stage
-FROM swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/golang:1.23.4-alpine3.20 AS builder
+FROM swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/golang:1.25-alpine3.22 AS builder
 
 WORKDIR /workspace
 

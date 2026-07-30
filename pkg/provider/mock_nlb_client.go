@@ -15,6 +15,7 @@ type MockNLBClient struct {
 	RemoveServersFromServerGroupFunc func(ctx context.Context, req *RemoveServersRequest) (*RemoveServersResponse, error)
 	GetJobStatusFunc                 func(ctx context.Context, jobId string) (string, error)
 	ListServerGroupsFunc             func(ctx context.Context, req *ListServerGroupsRequest) (*ListServerGroupsResponse, error)
+	ListServerGroupServersFunc       func(ctx context.Context, serverGroupId string) ([]BackendServer, error)
 	ListListenersFunc                func(ctx context.Context, req *ListListenersRequest) (*ListListenersResponse, error)
 	GetLoadBalancerEIPFunc           func(ctx context.Context, loadBalancerId string) (string, error)
 	GetServerGroupAttributeFunc      func(ctx context.Context, serverGroupId string) (*ServerGroupAttribute, error)
@@ -30,6 +31,9 @@ type MockNLBClient struct {
 	AddServersToServerGroupCalls      []AddServersRequest
 	RemoveServersFromServerGroupCalls []RemoveServersRequest
 	GetJobStatusCalls                 []string
+	ListServerGroupServersCalls       []string
+	DeleteServerGroupCalls            []string
+	DeleteListenerCalls               []string
 }
 
 func NewMockNLBClient() *MockNLBClient {
@@ -128,6 +132,12 @@ func (m *MockNLBClient) GetJobStatus(ctx context.Context, jobId string) (string,
 }
 
 func (m *MockNLBClient) ListServerGroupServers(ctx context.Context, serverGroupId string) ([]BackendServer, error) {
+	m.mu.Lock()
+	m.ListServerGroupServersCalls = append(m.ListServerGroupServersCalls, serverGroupId)
+	m.mu.Unlock()
+	if m.ListServerGroupServersFunc != nil {
+		return m.ListServerGroupServersFunc(ctx, serverGroupId)
+	}
 	return nil, nil
 }
 
@@ -153,6 +163,9 @@ func (m *MockNLBClient) Reset() {
 	m.AddServersToServerGroupCalls = nil
 	m.RemoveServersFromServerGroupCalls = nil
 	m.GetJobStatusCalls = nil
+	m.ListServerGroupServersCalls = nil
+	m.DeleteServerGroupCalls = nil
+	m.DeleteListenerCalls = nil
 }
 
 func (m *MockNLBClient) GetLoadBalancerEIP(ctx context.Context, loadBalancerId string) (string, error) {
@@ -173,6 +186,9 @@ func (m *MockNLBClient) GetServerGroupAttribute(ctx context.Context, serverGroup
 }
 
 func (m *MockNLBClient) DeleteServerGroup(ctx context.Context, serverGroupId string) error {
+	m.mu.Lock()
+	m.DeleteServerGroupCalls = append(m.DeleteServerGroupCalls, serverGroupId)
+	m.mu.Unlock()
 	if m.DeleteServerGroupFunc != nil {
 		return m.DeleteServerGroupFunc(ctx, serverGroupId)
 	}
@@ -190,6 +206,9 @@ func (m *MockNLBClient) GetListenerAttribute(ctx context.Context, listenerId str
 }
 
 func (m *MockNLBClient) DeleteListener(ctx context.Context, listenerId string) error {
+	m.mu.Lock()
+	m.DeleteListenerCalls = append(m.DeleteListenerCalls, listenerId)
+	m.mu.Unlock()
 	if m.DeleteListenerFunc != nil {
 		return m.DeleteListenerFunc(ctx, listenerId)
 	}
