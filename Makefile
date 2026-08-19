@@ -27,7 +27,7 @@ GOVULNCHECK_VERSION ?= v1.6.0
 # Go version used to build helper tools and to resolve the standard library
 # during vulnerability scanning. Must be a patched release, otherwise
 # govulncheck reports stdlib CVEs fixed in later patches.
-TOOL_GOTOOLCHAIN ?= go1.25.12
+TOOL_GOTOOLCHAIN ?= go1.25.13
 
 .PHONY: all
 all: build
