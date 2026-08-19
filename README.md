@@ -288,6 +288,9 @@ via the Downward API without any extra API access.
   Pods whose `alibabacloud.com/nlb-pa-claim` still points at the PA.
 - The feature is **disabled by default** and requires the flag
   `--enable-pod-result-annotation=true` on the NLB Pool Operator.
+  Note: enabling it for the first time writes the annotation once on every
+  existing `Bound` Pod (during the next steady-state reconcile, at most one
+  patch per Pod); consider enabling it during off-peak hours.
 
 ### Annotation value (JSON schema)
 
@@ -319,6 +322,30 @@ nlbPoolOperator:
 ```
 
 ### Consuming the annotation in a container
+
+Recommended: mount the Pod metadata as a `downwardAPI` volume. The volume file
+tracks the annotation at runtime, so the mapping becomes visible as soon as the
+controller writes it — no container restart required.
+
+```yaml
+volumes:
+- name: pod-metadata
+  downwardAPI:
+    items:
+    - path: nlb-port-mapping-result.json
+      fieldRef:
+        fieldPath: metadata.annotations['alibabacloud.com/nlb-port-mapping-result']
+volumeMounts:
+- name: pod-metadata
+  mountPath: /etc/nlb
+  readOnly: true
+```
+
+The container then reads `/etc/nlb/nlb-port-mapping-result.json`.
+
+Alternative (limited): expose it as an env var. Note that `env.fieldRef` is
+resolved only once at container creation, while the annotation is written after
+the Pod is running, so the env var stays empty until the container restarts.
 
 ```yaml
 env:

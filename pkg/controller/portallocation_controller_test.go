@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // newBoundTestPA builds a v6 PortAllocation with cloud SG/Listener status
@@ -760,5 +762,108 @@ func TestFeatureDisabled_NoPodAnnotationWrite(t *testing.T) {
 	}
 	if _, ok := getPod(t, fc, "game-pod-0").Annotations[nlbpoolv1alpha1.AnnotationPortMappingResult]; ok {
 		t.Error("feature disabled: result annotation must not appear in steady state")
+	}
+}
+
+func TestBound_MultiLaneAnnotationContainsAllLanes(t *testing.T) {
+	mock := newBindingMockNLBClient()
+	pa := newBoundTestPA(nlbpoolv1alpha1.PortAllocationBinding)
+	// Second lane to verify multi-lane serialization.
+	pa.Spec.Endpoints = append(pa.Spec.Endpoints, nlbpoolv1alpha1.LaneEndpoint{
+		Lane: "ctc",
+		EIP:  "5.6.7.8",
+		Ports: []nlbpoolv1alpha1.EndpointPort{
+			{Name: "game", ListenerPort: 10002, ContainerPort: 7777, Protocol: "TCP", ListenerId: "lsn-3"},
+			{Name: "query", ListenerPort: 10003, ContainerPort: 7778, Protocol: "UDP", ListenerId: "lsn-4"},
+		},
+	})
+	pod := newClaimedPod(false)
+	r, fc := newPAReconciler(t, mock, pa, pod)
+	r.EnablePodResultAnnotation = true
+
+	driveToBound(t, r, fc)
+
+	got := getPod(t, fc, "game-pod-0").Annotations[nlbpoolv1alpha1.AnnotationPortMappingResult]
+	var parsed []portMappingResult
+	if err := json.Unmarshal([]byte(got), &parsed); err != nil {
+		t.Fatalf("annotation is not valid JSON: %v", err)
+	}
+	if len(parsed) != 2 {
+		t.Fatalf("expected 2 lane entries, got %d: %s", len(parsed), got)
+	}
+	lanes := map[string]string{}
+	for _, entry := range parsed {
+		lanes[entry.Lane] = entry.IP
+		if len(entry.Ports) != 2 {
+			t.Errorf("lane %s: expected 2 ports, got %d", entry.Lane, len(entry.Ports))
+		}
+	}
+	if lanes["bgp"] != "1.2.3.4" || lanes["ctc"] != "5.6.7.8" {
+		t.Errorf("unexpected lane/IP mapping: %v", lanes)
+	}
+}
+
+func TestBound_PodPatchFailureRetriesWithoutPhaseRollback(t *testing.T) {
+	mock := newBindingMockNLBClient()
+	pa := newBoundTestPA(nlbpoolv1alpha1.PortAllocationBinding)
+	pod := newClaimedPod(false)
+	s := newTestScheme(t)
+	// Fail the first Pod patch (result annotation write); let everything else through.
+	failPodPatch := true
+	fc := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(pa, pod).WithStatusSubresource(pa, pod).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				if _, isPod := obj.(*corev1.Pod); isPod && failPodPatch {
+					failPodPatch = false
+					return fmt.Errorf("simulated pod patch failure")
+				}
+				return c.Patch(ctx, obj, patch, opts...)
+			},
+		}).Build()
+	r := &PortAllocationReconciler{
+		Client:                    fc,
+		Scheme:                    s,
+		Recorder:                  record.NewFakeRecorder(100),
+		NLBClient:                 mock,
+		EnablePodResultAnnotation: true,
+	}
+
+	// Drive to Bound; the round that transitions to Bound also attempts the
+	// annotation write, which fails and must return a 5s backoff.
+	var lastRequeue time.Duration
+	for i := 0; i < 10; i++ {
+		fresh := getPA(t, fc, "pool-s0")
+		if fresh.Status.Phase == nlbpoolv1alpha1.PortAllocationBound {
+			break
+		}
+		result, err := r.handleBinding(context.Background(), fresh)
+		if err != nil {
+			t.Fatalf("handleBinding #%d failed: %v", i, err)
+		}
+		lastRequeue = result.RequeueAfter
+	}
+	if lastRequeue != 5*time.Second {
+		t.Errorf("expected 5s requeue after failed annotation write, got %v", lastRequeue)
+	}
+
+	// Phase must stay Bound (no rollback); annotation not yet written.
+	if got := getPA(t, fc, "pool-s0").Status.Phase; got != nlbpoolv1alpha1.PortAllocationBound {
+		t.Fatalf("expected phase Bound despite write failure, got %q", got)
+	}
+	if _, ok := getPod(t, fc, "game-pod-0").Annotations[nlbpoolv1alpha1.AnnotationPortMappingResult]; ok {
+		t.Fatal("annotation must be absent after the failed patch")
+	}
+
+	// Next round (handleBound steady state) self-heals the write.
+	result, err := r.handleBound(context.Background(), getPA(t, fc, "pool-s0"))
+	if err != nil {
+		t.Fatalf("handleBound failed: %v", err)
+	}
+	if result.RequeueAfter != 30*time.Second {
+		t.Errorf("expected 30s steady-state requeue, got %v", result.RequeueAfter)
+	}
+	if got := getPod(t, fc, "game-pod-0").Annotations[nlbpoolv1alpha1.AnnotationPortMappingResult]; got != expectedMappingJSON {
+		t.Errorf("expected annotation written on retry, got %q", got)
 	}
 }

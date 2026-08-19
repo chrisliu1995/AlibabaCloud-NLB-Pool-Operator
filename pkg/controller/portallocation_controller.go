@@ -196,6 +196,9 @@ func (r *PortAllocationReconciler) handleDeletion(ctx context.Context, pa *nlbpo
 				"Failed to remove servers during deletion: %v", err)
 		}
 		r.clearPodClaim(ctx, pa)
+		// Issue #13: also drop the port-mapping result annotation while
+		// BoundPod is still set (must run before BoundPod is cleared below).
+		r.clearPodResultAnnotation(ctx, pa)
 		pa.Spec.BoundPod = ""
 		pa.Spec.BoundPodIP = ""
 		_ = r.Update(ctx, pa)
@@ -1386,9 +1389,14 @@ func (r *PortAllocationReconciler) handleDisabled(ctx context.Context, pa *nlbpo
 	}
 
 	// Issue #13: compensate for a missed cleanup while staying Disabled.
-	// 30s requeue closes the retry loop (Disabled PAs are rare; cost negligible).
+	// When the feature is enabled, a 30s requeue closes the retry loop
+	// (Disabled PAs are rare; cost negligible). Flag off keeps the original
+	// fully-silent behavior (no periodic requeue).
 	r.clearPodResultAnnotation(ctx, pa)
-	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	if r.EnablePodResultAnnotation {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	return ctrl.Result{}, nil
 }
 
 func (r *PortAllocationReconciler) handleDisable(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation) (ctrl.Result, error) {
@@ -1516,6 +1524,9 @@ func (r *PortAllocationReconciler) resetToAvailable(ctx context.Context, pa *nlb
 
 	// Clear the Pod's claim annotation so other PAs can claim it.
 	r.clearPodClaim(ctx, pa)
+	// Issue #13: also drop the port-mapping result annotation while BoundPod
+	// is still set (must run before BoundPod is cleared below).
+	r.clearPodResultAnnotation(ctx, pa)
 
 	pa.Spec.BoundPod = ""
 	pa.Spec.BoundPodIP = ""
@@ -1681,6 +1692,13 @@ func (r *PortAllocationReconciler) buildExternalAddresses(pa *nlbpoolv1alpha1.Po
 
 // clearPodClaim drops AnnotationPAClaim from the previously bound Pod, when
 // the annotation still points at this PA. Best-effort: errors are swallowed.
+//
+// Best-effort semantics (shared with clearPodResultAnnotation): cleanup on
+// the Releasing / Deletion paths is retried only within the current reconcile
+// pass; a failed patch is not requeued explicitly. Convergence relies on the
+// Pod being recreated by its workload or on the next PA claiming the Pod and
+// overwriting the annotations. This trade-off mirrors the long-standing
+// behavior of the claim annotation itself.
 func (r *PortAllocationReconciler) clearPodClaim(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation) {
 	if pa.Spec.BoundPod == "" {
 		return
@@ -1694,9 +1712,11 @@ func (r *PortAllocationReconciler) clearPodClaim(ctx context.Context, pa *nlbpoo
 	}
 	patch := client.MergeFrom(pod.DeepCopy())
 	delete(pod.Annotations, nlbpoolv1alpha1.AnnotationPAClaim)
-	// Issue #13: drop the port-mapping result annotation in the same patch.
-	// No-op if the key is already absent.
-	delete(pod.Annotations, nlbpoolv1alpha1.AnnotationPortMappingResult)
+	// Note: the Issue #13 result annotation is intentionally NOT deleted in
+	// this patch. Its removal is owned by clearPodResultAnnotation, which
+	// additionally handles the claim-mismatch case via a content-ownership
+	// fallback; doing it here would skip that fallback whenever the claim
+	// guard above rejects.
 	_ = r.Patch(ctx, pod, patch)
 }
 

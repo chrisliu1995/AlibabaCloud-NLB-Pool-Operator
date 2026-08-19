@@ -8,6 +8,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	nlbpoolv1alpha1 "github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/apis/v1alpha1"
 )
@@ -81,7 +82,14 @@ func (r *PortAllocationReconciler) syncPodResultAnnotation(ctx context.Context, 
 
 // clearPodResultAnnotation 删除绑定 Pod 上的端口映射结果注解（只删 result，
 // 保留 claim）。仿 clearPodClaim：BoundPod 为空返回；Pod NotFound 静默返回；
-// 仅当 claim 仍指向本 PA 时才删除；注解本就不存在则不发起 Patch；best-effort。
+// best-effort。
+//
+// 归属判定采用双守卫：claim 仍指向本 PA 时删除；claim 被外部清空/改写但
+// 注解内容与 buildPortMappingResult(pa) 完全一致（确系本 PA 所写）时仍删除，
+// 避免过期映射永久残留被容器持续消费；两者都不满足才放弃。
+//
+// Best-effort 语义与 clearPodClaim 一致：清理失败不显式重试，依赖 Pod
+// 重建或后任 PA 覆写收敛（取舍见 clearPodClaim 注释）。
 func (r *PortAllocationReconciler) clearPodResultAnnotation(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation) {
 	if !r.EnablePodResultAnnotation {
 		return
@@ -94,12 +102,17 @@ func (r *PortAllocationReconciler) clearPodResultAnnotation(ctx context.Context,
 		if errors.IsNotFound(err) {
 			return
 		}
+		log.FromContext(ctx).V(1).Info("failed to get pod while clearing port-mapping result annotation",
+			"pod", pa.Spec.BoundPod, "pa", pa.Name, "err", err.Error())
 		return
 	}
-	if pod.Annotations[nlbpoolv1alpha1.AnnotationPAClaim] != pa.Name {
+	current, ok := pod.Annotations[nlbpoolv1alpha1.AnnotationPortMappingResult]
+	if !ok {
 		return
 	}
-	if _, ok := pod.Annotations[nlbpoolv1alpha1.AnnotationPortMappingResult]; !ok {
+	claimMatches := pod.Annotations[nlbpoolv1alpha1.AnnotationPAClaim] == pa.Name
+	contentMatches := current == buildPortMappingResult(pa)
+	if !claimMatches && !contentMatches {
 		return
 	}
 	patch := client.MergeFrom(pod.DeepCopy())
