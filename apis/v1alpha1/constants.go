@@ -13,6 +13,10 @@ const (
 	AnnotationNetworkDisabled = "alibabacloud.com/nlb-network-disabled"
 	// PA Controller 写入的乐观锁
 	AnnotationPAClaim = "alibabacloud.com/nlb-pa-claim"
+	// AnnotationPortMappingResult 由 PA Controller 在 Bound 后写入绑定 Pod 的
+	// 端口映射结果（JSON），供容器经 Downward API 消费（Issue #13）。
+	// 释放 / 禁用时由控制器清理。
+	AnnotationPortMappingResult = "alibabacloud.com/nlb-port-mapping-result"
 
 	// NLBPool 删除安全边界注解（默认关闭，不影响现有 GitOps 删除语义）
 	// AnnotationDeletionProtection 为 "true" 时，级联删除被阻断，

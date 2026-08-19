@@ -274,6 +274,87 @@ The operator automatically selects the EIP management path based on `ispType` an
 
 4. **Deletion**: NLB/EIP CRs are deleted first (NLB cascade-deletes Listeners), then PAs (finalizers delete ServerGroups). EIPs are released via EIP CR deletion by EIP Operator. Deletion destroys real cloud resources; see [docs/deletion-safety.md](docs/deletion-safety.md) for the dry-run preview, the deletion-protection approval gate, and the recovery procedure.
 
+## Pod Port-Mapping Result Annotation (Downward API)
+
+When a PortAllocation reaches `Bound`, the PA Controller can write the allocated
+port mapping into an annotation on the bound Pod so containers can consume it
+via the Downward API without any extra API access.
+
+- Annotation key: `alibabacloud.com/nlb-port-mapping-result`
+- Written on `Bound` (and kept in sync during the `Bound` steady state); removed
+  when the PA is released (`Releasing`/deletion) or disabled (`Disabled`);
+  rewritten after re-enable reaches `Bound` again.
+- Writes are guarded by the PA claim annotation: the controller only touches
+  Pods whose `alibabacloud.com/nlb-pa-claim` still points at the PA.
+- The feature is **disabled by default** and requires the flag
+  `--enable-pod-result-annotation=true` on the NLB Pool Operator.
+  Note: enabling it for the first time writes the annotation once on every
+  existing `Bound` Pod (during the next steady-state reconcile, at most one
+  patch per Pod); consider enabling it during off-peak hours.
+
+### Annotation value (JSON schema)
+
+```json
+[
+  {
+    "lane": "bgp",
+    "ip": "1.2.3.4",
+    "ports": [
+      {
+        "name": "game",
+        "listenerPort": 10000,
+        "containerPort": 7777,
+        "protocol": "TCP"
+      }
+    ]
+  }
+]
+```
+
+One entry per lane (`spec.endpoints[]`). `containerPort` falls back to
+`listenerPort` when unset, matching the backend-server port semantics.
+
+### Enabling via the Helm chart
+
+```yaml
+nlbPoolOperator:
+  extraArgs: ["--enable-pod-result-annotation=true"]
+```
+
+### Consuming the annotation in a container
+
+Recommended: mount the Pod metadata as a `downwardAPI` volume. The volume file
+tracks the annotation at runtime, so the mapping becomes visible as soon as the
+controller writes it — no container restart required.
+
+```yaml
+volumes:
+- name: pod-metadata
+  downwardAPI:
+    items:
+    - path: nlb-port-mapping-result.json
+      fieldRef:
+        fieldPath: metadata.annotations['alibabacloud.com/nlb-port-mapping-result']
+volumeMounts:
+- name: pod-metadata
+  mountPath: /etc/nlb
+  readOnly: true
+```
+
+The container then reads `/etc/nlb/nlb-port-mapping-result.json`.
+
+Alternative (limited): expose it as an env var. Note that `env.fieldRef` is
+resolved only once at container creation, while the annotation is written after
+the Pod is running, so the env var stays empty until the container restarts.
+
+```yaml
+env:
+- name: NLB_MAPPING
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.annotations['alibabacloud.com/nlb-port-mapping-result']
+```
+
 ## License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.

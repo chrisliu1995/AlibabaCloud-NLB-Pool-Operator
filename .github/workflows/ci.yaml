@@ -12,7 +12,7 @@ permissions:
 env:
   # Must stay a patched release and match TOOL_GOTOOLCHAIN in the Makefile,
   # otherwise govulncheck reports stdlib CVEs fixed in later patches.
-  GO_VERSION: "1.25.12"
+  GO_VERSION: "1.25.13"
 
 jobs:
   test:

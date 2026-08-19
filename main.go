@@ -50,6 +50,7 @@ func main() {
 		listListenersQPS           float64
 		getServerGroupAttributeQPS float64
 		getJobStatusQPS            float64
+		enablePodResultAnnotation  bool
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
@@ -85,6 +86,8 @@ func main() {
 		"QPS limit for GetServerGroupAttribute. 0 disables local limiting.")
 	flag.Float64Var(&getJobStatusQPS, "get-job-status-qps", 20.0,
 		"QPS limit for GetJobStatus. 0 disables local limiting.")
+	flag.BoolVar(&enablePodResultAnnotation, "enable-pod-result-annotation", false,
+		"Write port-mapping result JSON into bound pod annotation for Downward API consumption")
 
 	opts := zap.Options{
 		Development: true,
@@ -177,10 +180,11 @@ func main() {
 
 	// PortAllocation Controller - drives AddServers / RemoveServers via NLB API.
 	if err = (&controller.PortAllocationReconciler{
-		Client:    mgr.GetClient(),
-		Scheme:    mgr.GetScheme(),
-		NLBClient: rateLimitedClient,
-		Recorder:  mgr.GetEventRecorderFor("portallocation-controller"),
+		Client:                    mgr.GetClient(),
+		Scheme:                    mgr.GetScheme(),
+		NLBClient:                 rateLimitedClient,
+		Recorder:                  mgr.GetEventRecorderFor("portallocation-controller"),
+		EnablePodResultAnnotation: enablePodResultAnnotation,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PortAllocation")
 		os.Exit(1)
