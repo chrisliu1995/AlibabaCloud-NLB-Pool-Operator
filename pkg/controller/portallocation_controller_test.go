@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	nlbv1 "github.com/chrisliu1995/AlibabaCloud-NLB-Operator/pkg/apis/nlboperator/v1"
 	nlbpoolv1alpha1 "github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/apis/v1alpha1"
@@ -106,6 +107,47 @@ func getPA(t *testing.T, fc client.Client, name string) *nlbpoolv1alpha1.PortAll
 		t.Fatalf("get PA %s: %v", name, err)
 	}
 	return pa
+}
+
+func getPod(t *testing.T, fc client.Client, name string) *corev1.Pod {
+	t.Helper()
+	pod := &corev1.Pod{}
+	if err := fc.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, pod); err != nil {
+		t.Fatalf("get pod %s: %v", name, err)
+	}
+	return pod
+}
+
+// driveToBound runs handleBinding until the PA reaches Bound.
+func driveToBound(t *testing.T, r *PortAllocationReconciler, fc client.Client) {
+	t.Helper()
+	for i := 0; i < 10; i++ {
+		fresh := getPA(t, fc, "pool-s0")
+		if fresh.Status.Phase == nlbpoolv1alpha1.PortAllocationBound {
+			return
+		}
+		if _, err := r.handleBinding(context.Background(), fresh); err != nil {
+			t.Fatalf("handleBinding #%d failed: %v", i, err)
+		}
+	}
+	t.Fatalf("PA did not reach Bound")
+}
+
+// newBindingMockNLBClient completes AddServers immediately.
+func newBindingMockNLBClient() *provider.MockNLBClient {
+	mock := provider.NewMockNLBClient()
+	added := map[string]bool{}
+	mock.AddServersToServerGroupFunc = func(ctx context.Context, req *provider.AddServersRequest) (*provider.AddServersResponse, error) {
+		added[req.ServerGroupId] = true
+		return &provider.AddServersResponse{}, nil
+	}
+	mock.ListServerGroupServersFunc = func(ctx context.Context, sgId string) ([]provider.BackendServer, error) {
+		if added[sgId] {
+			return []provider.BackendServer{{ServerIp: "10.0.0.1", Port: 7777}}, nil
+		}
+		return nil, nil
+	}
+	return mock
 }
 
 // =====================================================
@@ -479,5 +521,244 @@ func TestIdempotency_ProvisioningDoesNotDuplicateSGs(t *testing.T) {
 	if len(mock.CreateServerGroupCalls) != callsAfterFirst {
 		t.Errorf("re-provisioning must not create new SGs: %d -> %d",
 			callsAfterFirst, len(mock.CreateServerGroupCalls))
+	}
+}
+
+// =====================================================
+// Pod result annotation (Issue #13)
+// =====================================================
+
+const expectedMappingJSON = `[{"lane":"bgp","ip":"1.2.3.4","ports":` +
+	`[{"name":"game","listenerPort":10000,"containerPort":7777,"protocol":"TCP"},` +
+	`{"name":"query","listenerPort":10001,"containerPort":7778,"protocol":"UDP"}]}]`
+
+func TestBound_WritesPortMappingResultAnnotation(t *testing.T) {
+	mock := newBindingMockNLBClient()
+	pa := newBoundTestPA(nlbpoolv1alpha1.PortAllocationBinding)
+	// Drop ContainerPort on "query" to verify the ListenerPort fallback.
+	pa.Spec.Endpoints[0].Ports[1].ContainerPort = 0
+	pod := newClaimedPod(false)
+	r, fc := newPAReconciler(t, mock, pa, pod)
+	r.EnablePodResultAnnotation = true
+
+	driveToBound(t, r, fc)
+
+	want := `[{"lane":"bgp","ip":"1.2.3.4","ports":` +
+		`[{"name":"game","listenerPort":10000,"containerPort":7777,"protocol":"TCP"},` +
+		`{"name":"query","listenerPort":10001,"containerPort":10001,"protocol":"UDP"}]}]`
+	got := getPod(t, fc, "game-pod-0").Annotations[nlbpoolv1alpha1.AnnotationPortMappingResult]
+	if got != want {
+		t.Errorf("annotation mismatch:\n got  %s\n want %s", got, want)
+	}
+}
+
+func TestBound_AnnotationSyncIsIdempotent(t *testing.T) {
+	mock := newBindingMockNLBClient()
+	pa := newBoundTestPA(nlbpoolv1alpha1.PortAllocationBinding)
+	pod := newClaimedPod(false)
+	r, fc := newPAReconciler(t, mock, pa, pod)
+	r.EnablePodResultAnnotation = true
+
+	driveToBound(t, r, fc)
+
+	podBefore := getPod(t, fc, "game-pod-0")
+	if podBefore.Annotations[nlbpoolv1alpha1.AnnotationPortMappingResult] != expectedMappingJSON {
+		t.Fatalf("unexpected annotation after Bound: %q",
+			podBefore.Annotations[nlbpoolv1alpha1.AnnotationPortMappingResult])
+	}
+	rvBefore := podBefore.ResourceVersion
+
+	// handleBound steady-state pass: value unchanged -> no Patch must occur.
+	fresh := getPA(t, fc, "pool-s0")
+	result, err := r.handleBound(context.Background(), fresh)
+	if err != nil {
+		t.Fatalf("handleBound failed: %v", err)
+	}
+	if result.RequeueAfter != 30*time.Second {
+		t.Errorf("expected 30s requeue in steady state, got %v", result.RequeueAfter)
+	}
+	podAfter := getPod(t, fc, "game-pod-0")
+	if podAfter.Annotations[nlbpoolv1alpha1.AnnotationPortMappingResult] != expectedMappingJSON {
+		t.Error("annotation value changed unexpectedly")
+	}
+	if podAfter.ResourceVersion != rvBefore {
+		t.Errorf("expected no pod write (resourceVersion %s -> %s)", rvBefore, podAfter.ResourceVersion)
+	}
+}
+
+func TestRelease_ClearsPortMappingResultAnnotation(t *testing.T) {
+	mock := provider.NewMockNLBClient()
+	removed := map[string]bool{}
+	mock.ListServerGroupServersFunc = func(ctx context.Context, sgId string) ([]provider.BackendServer, error) {
+		if removed[sgId] {
+			return nil, nil
+		}
+		return []provider.BackendServer{{ServerIp: "10.0.0.1", Port: 7777}}, nil
+	}
+	mock.RemoveServersFromServerGroupFunc = func(ctx context.Context, req *provider.RemoveServersRequest) (*provider.RemoveServersResponse, error) {
+		removed[req.ServerGroupId] = true
+		return &provider.RemoveServersResponse{}, nil
+	}
+
+	pa := newBoundTestPA(nlbpoolv1alpha1.PortAllocationReleasing)
+	pa.Status.ServerGroups[0].ServerStatus = "Bound"
+	pa.Status.ServerGroups[1].ServerStatus = "Bound"
+	pod := newClaimedPod(false)
+	pod.Annotations[nlbpoolv1alpha1.AnnotationPortMappingResult] = expectedMappingJSON
+	r, fc := newPAReconciler(t, mock, pa, pod)
+	r.EnablePodResultAnnotation = true
+
+	for i := 0; i < 10; i++ {
+		fresh := getPA(t, fc, "pool-s0")
+		if fresh.Status.Phase == nlbpoolv1alpha1.PortAllocationAvailable {
+			break
+		}
+		if _, err := r.handleReleasing(context.Background(), fresh); err != nil {
+			t.Fatalf("handleReleasing #%d failed: %v", i, err)
+		}
+	}
+
+	freshPod := getPod(t, fc, "game-pod-0")
+	if _, ok := freshPod.Annotations[nlbpoolv1alpha1.AnnotationPortMappingResult]; ok {
+		t.Error("expected port-mapping result annotation removed after release")
+	}
+	if claim := freshPod.Annotations[nlbpoolv1alpha1.AnnotationPAClaim]; claim != "" {
+		t.Errorf("expected pod claim cleared, got %q", claim)
+	}
+}
+
+func TestDeletion_ClearsPortMappingResultAnnotation(t *testing.T) {
+	mock := provider.NewMockNLBClient()
+	// Listeners already gone (cascade), SG deletion succeeds.
+	mock.GetListenerAttributeFunc = func(ctx context.Context, listenerId string) (*provider.ListenerAttribute, error) {
+		return nil, nil
+	}
+
+	pa := newBoundTestPA(nlbpoolv1alpha1.PortAllocationBound)
+	pod := newClaimedPod(false)
+	pod.Annotations[nlbpoolv1alpha1.AnnotationPortMappingResult] = expectedMappingJSON
+	r, fc := newPAReconciler(t, mock, pa, pod)
+	r.EnablePodResultAnnotation = true
+
+	// fake client sets deletionTimestamp (finalizer present) instead of deleting.
+	if err := fc.Delete(context.Background(), getPA(t, fc, "pool-s0")); err != nil {
+		t.Fatalf("delete PA: %v", err)
+	}
+	for i := 0; i < 10; i++ {
+		fresh := getPA(t, fc, "pool-s0")
+		if _, err := r.handleDeletion(context.Background(), fresh); err != nil {
+			t.Fatalf("handleDeletion #%d failed: %v", i, err)
+		}
+		if err := fc.Get(context.Background(), types.NamespacedName{Name: "pool-s0", Namespace: "default"}, &nlbpoolv1alpha1.PortAllocation{}); err != nil {
+			break // PA fully deleted
+		}
+	}
+
+	freshPod := getPod(t, fc, "game-pod-0")
+	if _, ok := freshPod.Annotations[nlbpoolv1alpha1.AnnotationPortMappingResult]; ok {
+		t.Error("expected port-mapping result annotation removed after deletion")
+	}
+}
+
+func TestDisable_ClearsResultAnnotationKeepsClaim_ReEnableRewrites(t *testing.T) {
+	// Shared backend state: servers start present; Add/Remove/List all follow it.
+	added := map[string]bool{"sg-1": true, "sg-2": true}
+	mock := provider.NewMockNLBClient()
+	mock.AddServersToServerGroupFunc = func(ctx context.Context, req *provider.AddServersRequest) (*provider.AddServersResponse, error) {
+		added[req.ServerGroupId] = true
+		return &provider.AddServersResponse{}, nil
+	}
+	mock.RemoveServersFromServerGroupFunc = func(ctx context.Context, req *provider.RemoveServersRequest) (*provider.RemoveServersResponse, error) {
+		added[req.ServerGroupId] = false
+		return &provider.RemoveServersResponse{}, nil
+	}
+	mock.ListServerGroupServersFunc = func(ctx context.Context, sgId string) ([]provider.BackendServer, error) {
+		if added[sgId] {
+			return []provider.BackendServer{{ServerIp: "10.0.0.1", Port: 7777}}, nil
+		}
+		return nil, nil
+	}
+
+	pa := newBoundTestPA(nlbpoolv1alpha1.PortAllocationBound)
+	pa.Status.ServerGroups[0].ServerStatus = "Bound"
+	pa.Status.ServerGroups[1].ServerStatus = "Bound"
+	pod := newClaimedPod(true) // network-disabled
+	pod.Annotations[nlbpoolv1alpha1.AnnotationPortMappingResult] = expectedMappingJSON
+	r, fc := newPAReconciler(t, mock, pa, pod)
+	r.EnablePodResultAnnotation = true
+
+	// Drive to Disabled.
+	for i := 0; i < 10; i++ {
+		fresh := getPA(t, fc, "pool-s0")
+		if fresh.Status.Phase == nlbpoolv1alpha1.PortAllocationDisabled {
+			break
+		}
+		if _, err := r.handleBound(context.Background(), fresh); err != nil {
+			t.Fatalf("handleBound #%d failed: %v", i, err)
+		}
+	}
+	if got := getPA(t, fc, "pool-s0").Status.Phase; got != nlbpoolv1alpha1.PortAllocationDisabled {
+		t.Fatalf("expected phase Disabled, got %q", got)
+	}
+
+	// Annotation removed, claim retained for re-enable.
+	disabledPod := getPod(t, fc, "game-pod-0")
+	if _, ok := disabledPod.Annotations[nlbpoolv1alpha1.AnnotationPortMappingResult]; ok {
+		t.Error("expected result annotation removed on disable")
+	}
+	if disabledPod.Annotations[nlbpoolv1alpha1.AnnotationPAClaim] != "pool-s0" {
+		t.Errorf("expected claim retained on disable, got %q",
+			disabledPod.Annotations[nlbpoolv1alpha1.AnnotationPAClaim])
+	}
+
+	// Re-enable: drop the disabled annotation, drive Disabled -> Binding -> Bound.
+	disabledPod.Annotations[nlbpoolv1alpha1.AnnotationNetworkDisabled] = ""
+	if err := fc.Update(context.Background(), disabledPod); err != nil {
+		t.Fatalf("update pod: %v", err)
+	}
+	if _, err := r.handleDisabled(context.Background(), getPA(t, fc, "pool-s0")); err != nil {
+		t.Fatalf("handleDisabled failed: %v", err)
+	}
+	if got := getPA(t, fc, "pool-s0").Status.Phase; got != nlbpoolv1alpha1.PortAllocationBinding {
+		t.Fatalf("expected phase Binding after re-enable, got %q", got)
+	}
+	driveToBound(t, r, fc)
+
+	if got := getPod(t, fc, "game-pod-0").Annotations[nlbpoolv1alpha1.AnnotationPortMappingResult]; got != expectedMappingJSON {
+		t.Errorf("expected annotation rewritten after re-enable, got %q", got)
+	}
+}
+
+func TestClearPodResultAnnotation_PodNotFoundSilent(t *testing.T) {
+	mock := provider.NewMockNLBClient()
+	pa := newBoundTestPA(nlbpoolv1alpha1.PortAllocationBound)
+	pa.Spec.BoundPod = "ghost-pod" // does not exist
+	r, _ := newPAReconciler(t, mock, pa)
+	r.EnablePodResultAnnotation = true
+
+	// Must not panic or surface an error (function returns nothing; best-effort).
+	r.clearPodResultAnnotation(context.Background(), pa)
+}
+
+func TestFeatureDisabled_NoPodAnnotationWrite(t *testing.T) {
+	mock := newBindingMockNLBClient()
+	pa := newBoundTestPA(nlbpoolv1alpha1.PortAllocationBinding)
+	pod := newClaimedPod(false)
+	r, fc := newPAReconciler(t, mock, pa, pod)
+	// EnablePodResultAnnotation stays false (default).
+
+	driveToBound(t, r, fc)
+
+	freshPod := getPod(t, fc, "game-pod-0")
+	if _, ok := freshPod.Annotations[nlbpoolv1alpha1.AnnotationPortMappingResult]; ok {
+		t.Error("feature disabled: result annotation must not be written")
+	}
+
+	// Steady-state handleBound must not write either.
+	if _, err := r.handleBound(context.Background(), getPA(t, fc, "pool-s0")); err != nil {
+		t.Fatalf("handleBound failed: %v", err)
+	}
+	if _, ok := getPod(t, fc, "game-pod-0").Annotations[nlbpoolv1alpha1.AnnotationPortMappingResult]; ok {
+		t.Error("feature disabled: result annotation must not appear in steady state")
 	}
 }

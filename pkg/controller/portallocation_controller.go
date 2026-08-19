@@ -46,6 +46,10 @@ type PortAllocationReconciler struct {
 	NLBClient     provider.NLBAPIClient
 	Recorder      record.EventRecorder
 	nlbSemaphores sync.Map // key=nlbId -> chan struct{} (cap=1), per-NLB CreateListener serialization
+	// EnablePodResultAnnotation 开启后，Bound 时将端口映射结果 JSON 写入
+	// 绑定 Pod 的注解 AnnotationPortMappingResult（Issue #13），供容器经
+	// Downward API 消费；释放 / 禁用时清理。默认关闭。
+	EnablePodResultAnnotation bool
 }
 
 // +kubebuilder:rbac:groups=nlbpool.alibabacloud.com,resources=portallocations,verbs=get;list;watch;create;update;patch;delete
@@ -1182,6 +1186,13 @@ func (r *PortAllocationReconciler) handleBinding(ctx context.Context, pa *nlbpoo
 	}
 	r.updatePhaseLabel(ctx, pa)
 	r.eventf(pa, corev1.EventTypeNormal, "Bound", "Successfully bound to pod %s", pa.Spec.BoundPod)
+	// Issue #13: write port-mapping result into the bound pod annotation.
+	// Failure does not roll back the Bound phase; retry next round.
+	if err := r.syncPodResultAnnotation(ctx, pa, pod); err != nil {
+		r.eventf(pa, corev1.EventTypeWarning, "SyncPodResultAnnotationFailed",
+			"Failed to sync port-mapping result annotation on pod %s: %v", pod.Name, err)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
 	return ctrl.Result{}, nil
 }
 
@@ -1213,6 +1224,13 @@ func (r *PortAllocationReconciler) handleBound(ctx context.Context, pa *nlbpoolv
 	}
 
 	// Binding is stable. Periodic requeue to detect Pod deletion if watch event is lost.
+	// Issue #13: keep the pod annotation in sync (idempotent guard makes this
+	// a no-op write in steady state). On failure keep the 30s requeue unchanged;
+	// the next round self-heals.
+	if err := r.syncPodResultAnnotation(ctx, pa, pod); err != nil {
+		r.eventf(pa, corev1.EventTypeWarning, "SyncPodResultAnnotationFailed",
+			"Failed to sync port-mapping result annotation on pod %s: %v", pod.Name, err)
+	}
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
@@ -1367,7 +1385,10 @@ func (r *PortAllocationReconciler) handleDisabled(ctx context.Context, pa *nlbpo
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	return ctrl.Result{}, nil
+	// Issue #13: compensate for a missed cleanup while staying Disabled.
+	// 30s requeue closes the retry loop (Disabled PAs are rare; cost negligible).
+	r.clearPodResultAnnotation(ctx, pa)
+	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
 func (r *PortAllocationReconciler) handleDisable(ctx context.Context, pa *nlbpoolv1alpha1.PortAllocation) (ctrl.Result, error) {
@@ -1456,6 +1477,9 @@ func (r *PortAllocationReconciler) handleDisable(ctx context.Context, pa *nlbpoo
 	r.updatePhaseLabel(ctx, pa)
 	r.eventf(pa, corev1.EventTypeNormal, "Disabled",
 		"Network disabled for pod %s", pa.Spec.BoundPod)
+	// Issue #13: drop the port-mapping result annotation (claim is retained
+	// for re-enable).
+	r.clearPodResultAnnotation(ctx, pa)
 	return ctrl.Result{}, nil
 }
 
@@ -1670,6 +1694,9 @@ func (r *PortAllocationReconciler) clearPodClaim(ctx context.Context, pa *nlbpoo
 	}
 	patch := client.MergeFrom(pod.DeepCopy())
 	delete(pod.Annotations, nlbpoolv1alpha1.AnnotationPAClaim)
+	// Issue #13: drop the port-mapping result annotation in the same patch.
+	// No-op if the key is already absent.
+	delete(pod.Annotations, nlbpoolv1alpha1.AnnotationPortMappingResult)
 	_ = r.Patch(ctx, pod, patch)
 }
 
