@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	nlbv1 "github.com/chrisliu1995/AlibabaCloud-NLB-Operator/pkg/apis/nlboperator/v1"
 	nlbpoolv1alpha1 "github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/apis/v1alpha1"
 	"github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator/pkg/provider"
 
+	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -279,6 +281,69 @@ func TestBinding_ThrottlingIsRetryableNotFatal(t *testing.T) {
 	final := getPA(t, fc, "pool-s0")
 	if final.Status.Phase != nlbpoolv1alpha1.PortAllocationBinding {
 		t.Errorf("expected phase to remain Binding on throttling, got %q", final.Status.Phase)
+	}
+}
+
+func TestBinding_ConfigurableBurstControlsSingleReconcileFanout(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		burst         int
+		expectedCalls int
+	}{
+		{name: "default burst defers remaining server groups", burst: 5, expectedCalls: 5},
+		{name: "60 burst submits all server groups", burst: 60, expectedCalls: 60},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := provider.NewMockNLBClient()
+			limited := provider.NewRateLimitedClient(mock)
+			limited.AddServersLimiter = rate.NewLimiter(rate.Limit(0.001), tc.burst)
+
+			pa := newBoundTestPA(nlbpoolv1alpha1.PortAllocationBinding)
+			pa.Spec.ServerGroups = nil
+			pa.Spec.Endpoints[0].Ports = nil
+			pa.Status.ServerGroups = nil
+			for i := 0; i < 60; i++ {
+				name := fmt.Sprintf("port-%d", i)
+				sgID := fmt.Sprintf("sg-%d", i)
+				pa.Spec.ServerGroups = append(pa.Spec.ServerGroups, nlbpoolv1alpha1.ServerGroupRef{
+					Name: name, ServerGroupId: sgID,
+				})
+				pa.Spec.Endpoints[0].Ports = append(pa.Spec.Endpoints[0].Ports, nlbpoolv1alpha1.EndpointPort{
+					Name: name, ListenerPort: int32(10000 + i), ContainerPort: int32(7000 + i), Protocol: "TCP",
+				})
+				pa.Status.ServerGroups = append(pa.Status.ServerGroups, nlbpoolv1alpha1.ServerGroupCloudStatus{
+					Name: name, ServerGroupId: sgID, Phase: "Active",
+				})
+			}
+			pa.Status.SGsTotal = 60
+			pa.Status.SGsReady = 60
+
+			pod := newClaimedPod(false)
+			r, fc := newPAReconciler(t, mock, pa, pod)
+			r.NLBClient = limited
+
+			result, err := r.handleBinding(context.Background(), getPA(t, fc, "pool-s0"))
+			if err != nil {
+				t.Fatalf("handleBinding failed: %v", err)
+			}
+			if result.RequeueAfter != 5*time.Second {
+				t.Fatalf("expected a 5s requeue, got %s", result.RequeueAfter)
+			}
+			if got := len(mock.AddServersToServerGroupCalls); got != tc.expectedCalls {
+				t.Fatalf("expected %d AddServers calls to reach the cloud client, got %d", tc.expectedCalls, got)
+			}
+
+			final := getPA(t, fc, "pool-s0")
+			adding := 0
+			for _, sg := range final.Status.ServerGroups {
+				if sg.ServerStatus == "Adding" {
+					adding++
+				}
+			}
+			if adding != tc.expectedCalls {
+				t.Fatalf("expected %d SGs Adding, got %d", tc.expectedCalls, adding)
+			}
+		})
 	}
 }
 

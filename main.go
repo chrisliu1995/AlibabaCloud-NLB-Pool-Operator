@@ -33,23 +33,26 @@ func init() {
 
 func main() {
 	var (
-		metricsAddr                string
-		enableLeaderElection       bool
-		probeAddr                  string
-		addServersQPS              float64
-		removeServersQPS           float64
-		kubeAPIQPS                 float64
-		kubeAPIBurst               int
-		createSGQPS                float64
-		createListenerQPS          float64
-		getListenerQPS             float64
-		deleteListenerQPS          float64
-		deleteSGQPS                float64
-		listListenersByPortQPS     float64
-		listServerGroupServersQPS  float64
-		listListenersQPS           float64
-		getServerGroupAttributeQPS float64
-		getJobStatusQPS            float64
+		metricsAddr                 string
+		enableLeaderElection        bool
+		probeAddr                   string
+		addServersQPS               float64
+		addServersBurst             int
+		removeServersQPS            float64
+		removeServersBurst          int
+		kubeAPIQPS                  float64
+		kubeAPIBurst                int
+		createSGQPS                 float64
+		createListenerQPS           float64
+		getListenerQPS              float64
+		deleteListenerQPS           float64
+		deleteSGQPS                 float64
+		listListenersByPortQPS      float64
+		listServerGroupServersQPS   float64
+		listServerGroupServersBurst int
+		listListenersQPS            float64
+		getServerGroupAttributeQPS  float64
+		getJobStatusQPS             float64
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
@@ -59,8 +62,12 @@ func main() {
 			"Enabling this will ensure there is only one active controller manager.")
 	flag.Float64Var(&addServersQPS, "add-servers-qps", 0,
 		"QPS limit for AddServersToServerGroup. 0 disables local limiting.")
+	flag.IntVar(&addServersBurst, "add-servers-burst", 5,
+		"Burst limit for AddServersToServerGroup.")
 	flag.Float64Var(&removeServersQPS, "remove-servers-qps", 0,
 		"QPS limit for RemoveServersFromServerGroup. 0 disables local limiting.")
+	flag.IntVar(&removeServersBurst, "remove-servers-burst", 5,
+		"Burst limit for RemoveServersFromServerGroup.")
 	flag.Float64Var(&kubeAPIQPS, "kube-api-qps", 50,
 		"QPS for requests to the Kubernetes API server.")
 	flag.IntVar(&kubeAPIBurst, "kube-api-burst", 100,
@@ -79,6 +86,8 @@ func main() {
 		"QPS limit for ListListenersByPort. 0 disables local limiting.")
 	flag.Float64Var(&listServerGroupServersQPS, "list-server-group-servers-qps", 20.0,
 		"QPS limit for ListServerGroupServers. 0 disables local limiting.")
+	flag.IntVar(&listServerGroupServersBurst, "list-server-group-servers-burst", 10,
+		"Burst limit for ListServerGroupServers.")
 	flag.Float64Var(&listListenersQPS, "list-listeners-qps", 20.0,
 		"QPS limit for ListListeners. 0 disables local limiting.")
 	flag.Float64Var(&getServerGroupAttributeQPS, "get-server-group-attribute-qps", 20.0,
@@ -128,10 +137,10 @@ func main() {
 	// 200/60s ~= 3.3 QPS) are limited; all other interfaces pass through.
 	rateLimitedClient := provider.NewRateLimitedClient(nlbClient)
 	if addServersQPS > 0 {
-		rateLimitedClient.AddServersLimiter = rate.NewLimiter(rate.Limit(addServersQPS), 5)
+		rateLimitedClient.AddServersLimiter = rate.NewLimiter(rate.Limit(addServersQPS), addServersBurst)
 	}
 	if removeServersQPS > 0 {
-		rateLimitedClient.RemoveServersLimiter = rate.NewLimiter(rate.Limit(removeServersQPS), 5)
+		rateLimitedClient.RemoveServersLimiter = rate.NewLimiter(rate.Limit(removeServersQPS), removeServersBurst)
 	}
 	if createSGQPS > 0 {
 		rateLimitedClient.CreateSGLimiter = rate.NewLimiter(rate.Limit(createSGQPS), 3)
@@ -152,7 +161,7 @@ func main() {
 		rateLimitedClient.ListListenersByPortLimiter = rate.NewLimiter(rate.Limit(listListenersByPortQPS), 5)
 	}
 	if listServerGroupServersQPS > 0 {
-		rateLimitedClient.ListSGLimiter = rate.NewLimiter(rate.Limit(listServerGroupServersQPS), 10)
+		rateLimitedClient.ListSGLimiter = rate.NewLimiter(rate.Limit(listServerGroupServersQPS), listServerGroupServersBurst)
 	}
 	if listListenersQPS > 0 {
 		rateLimitedClient.ListListenersLimiter = rate.NewLimiter(rate.Limit(listListenersQPS), 10)
