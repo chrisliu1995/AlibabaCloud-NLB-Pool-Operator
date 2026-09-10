@@ -2,7 +2,7 @@ module github.com/chrisliu1995/AlibabaCloud-NLB-Pool-Operator
 
 go 1.25.0
 
-toolchain go1.25.12
+toolchain go1.25.13
 
 require (
 	github.com/alibabacloud-go/darabonba-openapi/v2 v2.1.16

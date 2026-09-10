@@ -32,6 +32,20 @@ func TestRateLimiter_RejectsWhenBucketExhausted(t *testing.T) {
 	}
 }
 
+func TestRateLimiter_ZeroBurstRejectsAllCalls(t *testing.T) {
+	mock := NewMockNLBClient()
+	rl := NewRateLimitedClient(mock)
+	rl.AddServersLimiter = rate.NewLimiter(rate.Limit(30), 0)
+
+	_, err := rl.AddServersToServerGroup(context.Background(), &AddServersRequest{ServerGroupId: "sg-1"})
+	if !IsLocalRateLimited(err) {
+		t.Fatalf("zero burst must reject the call locally, got: %v", err)
+	}
+	if len(mock.AddServersToServerGroupCalls) != 0 {
+		t.Fatalf("zero burst must not reach the cloud client, got %d calls", len(mock.AddServersToServerGroupCalls))
+	}
+}
+
 func TestRateLimiter_NilLimiterPassesThrough(t *testing.T) {
 	mock := NewMockNLBClient()
 	rl := NewRateLimitedClient(mock)
