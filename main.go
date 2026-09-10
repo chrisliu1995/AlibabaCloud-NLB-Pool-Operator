@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 
 	"golang.org/x/time/rate"
@@ -29,6 +30,23 @@ func init() {
 	_ = nlbpov1alpha1.AddToScheme(scheme)
 	_ = nlbv1.SchemeBuilder.AddToScheme(scheme)
 	_ = eipv1.AddToScheme(scheme)
+}
+
+func validateAPILimiter(qps float64, burst int) error {
+	if qps > 0 && burst <= 0 {
+		return fmt.Errorf("burst must be greater than 0 when QPS limiting is enabled")
+	}
+	return nil
+}
+
+func flagWasSet(name string) bool {
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
 }
 
 func main() {
@@ -63,11 +81,11 @@ func main() {
 	flag.Float64Var(&addServersQPS, "add-servers-qps", 0,
 		"QPS limit for AddServersToServerGroup. 0 disables local limiting.")
 	flag.IntVar(&addServersBurst, "add-servers-burst", 5,
-		"Burst limit for AddServersToServerGroup.")
+		"Burst limit for AddServersToServerGroup. Only effective when --add-servers-qps > 0.")
 	flag.Float64Var(&removeServersQPS, "remove-servers-qps", 0,
 		"QPS limit for RemoveServersFromServerGroup. 0 disables local limiting.")
 	flag.IntVar(&removeServersBurst, "remove-servers-burst", 5,
-		"Burst limit for RemoveServersFromServerGroup.")
+		"Burst limit for RemoveServersFromServerGroup. Only effective when --remove-servers-qps > 0.")
 	flag.Float64Var(&kubeAPIQPS, "kube-api-qps", 50,
 		"QPS for requests to the Kubernetes API server.")
 	flag.IntVar(&kubeAPIBurst, "kube-api-burst", 100,
@@ -87,7 +105,7 @@ func main() {
 	flag.Float64Var(&listServerGroupServersQPS, "list-server-group-servers-qps", 20.0,
 		"QPS limit for ListServerGroupServers. 0 disables local limiting.")
 	flag.IntVar(&listServerGroupServersBurst, "list-server-group-servers-burst", 10,
-		"Burst limit for ListServerGroupServers.")
+		"Burst limit for ListServerGroupServers. Only effective when --list-server-group-servers-qps > 0.")
 	flag.Float64Var(&listListenersQPS, "list-listeners-qps", 20.0,
 		"QPS limit for ListListeners. 0 disables local limiting.")
 	flag.Float64Var(&getServerGroupAttributeQPS, "get-server-group-attribute-qps", 20.0,
@@ -102,6 +120,28 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	limiterConfigs := []struct {
+		qpsFlag   string
+		burstFlag string
+		qps       float64
+		burst     int
+	}{
+		{"add-servers-qps", "add-servers-burst", addServersQPS, addServersBurst},
+		{"remove-servers-qps", "remove-servers-burst", removeServersQPS, removeServersBurst},
+		{"list-server-group-servers-qps", "list-server-group-servers-burst", listServerGroupServersQPS, listServerGroupServersBurst},
+	}
+	for _, config := range limiterConfigs {
+		if err := validateAPILimiter(config.qps, config.burst); err != nil {
+			setupLog.Error(err, "invalid API rate limiter configuration",
+				"qpsFlag", config.qpsFlag, "burstFlag", config.burstFlag,
+				"qps", config.qps, "burst", config.burst)
+			os.Exit(1)
+		}
+		if config.qps == 0 && flagWasSet(config.burstFlag) {
+			setupLog.Info("burst setting has no effect because local QPS limiting is disabled",
+				"qpsFlag", config.qpsFlag, "burstFlag", config.burstFlag)
+		}
+	}
 
 	cfg := ctrl.GetConfigOrDie()
 	cfg.QPS = float32(kubeAPIQPS)
